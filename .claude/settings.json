@@ -1,0 +1,32 @@
+{
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(forge build:*)",
+      "Bash(forge test:*)",
+      "Bash(forge fmt:*)",
+      "Bash(forge script:*)",
+      "Bash(forge coverage:*)",
+      "Bash(forge install:*)",
+      "Bash(forge remappings:*)",
+      "Bash(forge clean)",
+      "Bash(cast :*)",
+      "Bash(anvil:*)",
+      "Bash(slither:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git restore:*)",
+      "Bash(git stash:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}

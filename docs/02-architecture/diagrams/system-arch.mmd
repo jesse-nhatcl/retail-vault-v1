@@ -1,0 +1,42 @@
+flowchart TB
+    subgraph external["External World (single Anvil chain)"]
+        Admin["Admin EOA<br/>(deployer, single owner)"]
+        Alice["Retail: Alice"]
+        Bob["Retail: Bob"]
+        Charlie["Retail: Charlie"]
+    end
+
+    subgraph production["Production Contracts"]
+        Vault["Vault.sol<br/>━━━━━━━━━<br/>State machine (5 states)<br/>Subscription queue<br/>Redemption queue<br/>Matching algorithm<br/>processEpoch()<br/>ERC-20 shares"]
+        Custody["Custody.sol<br/>━━━━━━━━━<br/>Holds wRWA balance<br/>Holds liquid buffer<br/>Holds idle USDC<br/>onlyVault gate"]
+    end
+
+    subgraph mocks["Mock Contracts (POC stand-ins)"]
+        USDC["MockUSDC<br/>(6 decimals)"]
+        Pruv["MockPruv<br/>(Hamilton-Lane mock)<br/>subscribe/redeem<br/>admin setPrice"]
+        Liquid["MockLiquidBuffer<br/>(yield-bearing ERC-20)"]
+        AMM["MockAMM<br/>(1:1 swap)"]
+    end
+
+    Admin -.->|"setPrice(),<br/>processEpoch(),<br/>triggerWindDown()"| Vault
+    Alice -->|"depositToLaunchpad,<br/>requestDeposit,<br/>requestRedeem,<br/>cancelRequest,<br/>claim"| Vault
+    Bob --> Vault
+    Charlie --> Vault
+
+    Vault -->|"controls<br/>(onlyVault)"| Custody
+    Vault -->|"mint/burn<br/>shares"| Vault
+
+    Custody -->|"subscribe(usdc),<br/>redeem(wRWA)"| Pruv
+    Custody -->|"swap"| AMM
+    Custody -->|"hold balance"| USDC
+    Custody -->|"hold balance"| Liquid
+
+    Admin -.->|"setPrice()<br/>(for NAV)"| Pruv
+
+    classDef productionStyle fill:#1e3a5f,stroke:#4a90e2,color:#fff
+    classDef mockStyle fill:#5c3317,stroke:#d4924a,color:#fff
+    classDef externalStyle fill:#2d4a2e,stroke:#5fa663,color:#fff
+
+    class Vault,Custody productionStyle
+    class USDC,Pruv,Liquid,AMM mockStyle
+    class Admin,Alice,Bob,Charlie externalStyle

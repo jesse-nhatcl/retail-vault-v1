@@ -1,0 +1,8 @@
+{
+  "name": "retail-access-vault",
+  "format": "markdown",
+  "created": "2026-06-02",
+  "source_prd": "/Users/jesse/Downloads/PRD Retail Access (1).pdf",
+  "scope": "local-poc-alt1",
+  "intent": "Prove feasibility of Alt-1 (self-built custody + liquid/illiquid mix). Not a product."
+}

@@ -1,0 +1,74 @@
+sequenceDiagram
+    autonumber
+    participant Admin
+    participant Vault
+    participant Custody
+    participant Pruv as MockPruv
+    participant AMM as MockAMM
+    participant USDC as MockUSDC
+
+    Note over Admin: Step 0: update NAV before epoch
+    Admin->>Pruv: setPrice(newWRWAPrice)
+
+    Admin->>Vault: processEpoch()
+    activate Vault
+
+    Note over Vault: Step 1: Snapshot queues
+    Vault->>Vault: subQueueUSDC = sum(pending sub)
+    Vault->>Vault: redeemQueueShares = sum(pending redeem)
+    Vault->>Pruv: pricePerWRWA()
+    Pruv-->>Vault: price
+    Vault->>Custody: balances (wRWA, liquid, USDC)
+    Custody-->>Vault: balances
+    Vault->>Vault: nav = totalAssets / totalSupply
+
+    Note over Vault: Step 2: Matching (P2P)
+    Vault->>Vault: matched = min(subUSDC, redeemUSDC)
+    Vault->>Vault: distribute matched shares pro-rata to subs
+    Vault->>Vault: distribute matched USDC pro-rata to redeemers
+    Vault->>Vault: burn matched portion of redeemer shares
+
+    alt subUSDC > redeemUSDC (Sub > Redeem case)
+        Note over Vault: Step 3a: Settle net sub (buy assets)
+        Vault->>Vault: netSub = subUSDC - redeemUSDC
+        Vault->>Vault: compute target buy split (rebalance toward 80/20)
+        Vault->>Custody: depositUSDC(buyIlliquid + buyLiquid)
+        Vault->>Custody: subscribeToPruv(buyIlliquid)
+        Custody->>USDC: approve + transfer to Pruv
+        Custody->>Pruv: subscribe(buyIlliquid)
+        Pruv-->>Custody: wRWA minted
+        Vault->>Custody: swapUSDCForLiquid(buyLiquid)
+        Custody->>USDC: approve + transfer to AMM
+        Custody->>AMM: swap(USDC → liquid)
+        AMM-->>Custody: liquid tokens
+        Vault->>Vault: mint additional shares to net sub subscribers
+    else redeemUSDC > subUSDC (Redeem > Sub case)
+        Note over Vault: Step 3b: Settle net redeem (3-layer)
+        Vault->>Vault: netRedeem = redeemUSDC - subUSDC
+
+        Note over Vault,Custody: Layer 2 — Liquid buffer
+        Vault->>Custody: liquidBalance()
+        Custody-->>Vault: liquidAvail
+        Vault->>Custody: swapLiquidForUSDC(min(need, liquidAvail))
+        Custody->>AMM: swap(liquid → USDC)
+        AMM-->>Custody: USDC
+
+        Note over Vault,Custody: Layer 3 — Illiquid (if needed)
+        opt liquid insufficient
+            Vault->>Custody: redeemFromPruv(remaining/price)
+            Custody->>Pruv: redeem(wRWAAmount)
+            Pruv-->>Custody: USDC returned
+        end
+
+        Vault->>Custody: withdrawUSDC(redeemers, payouts)
+        Custody->>USDC: transfer to each redeemer
+        Vault->>Vault: burn shares of net redeem requesters
+    else exact match
+        Note over Vault: Step 3c: No asset action needed
+    end
+
+    Note over Vault: Step 4: Mark queues processed
+    Vault->>Vault: emit EpochProcessed(epoch, ...)
+    deactivate Vault
+
+    Note over Admin,USDC: Users can now claim() against processed requests

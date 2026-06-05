@@ -1,0 +1,35 @@
+stateDiagram-v2
+    [*] --> Initialized: deploy
+    Initialized --> LaunchpadStart: launchpadStartTime reached
+    LaunchpadStart --> EpochBased: success<br/>(totalLocked &ge; min)
+    LaunchpadStart --> LaunchpadFail: time expired<br/>(totalLocked &lt; min)
+    LaunchpadFail --> [*]: all users<br/>refund()
+    EpochBased --> EpochBased: processEpoch()<br/>(loop)
+    EpochBased --> WindDown: admin triggers
+    WindDown --> Closed: all redemptions<br/>settled
+    Closed --> [*]
+
+    note right of Initialized
+        Vault deployed but
+        launchpad time not yet reached.
+        All transactions disabled.
+    end note
+
+    note right of LaunchpadStart
+        Retail locks USDC.
+        Internal receipt mapping.
+        No shares minted yet.
+    end note
+
+    note right of EpochBased
+        Normal operating phase.
+        Async sub/redeem queue.
+        Periodic processEpoch().
+    end note
+
+    note left of WindDown
+        Refund pending sub.
+        Liquidate liquid buffer.
+        Redeem illiquid from Pruv.
+        Settle redemption queue.
+    end note

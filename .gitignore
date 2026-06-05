@@ -1,0 +1,16 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Dependencies are vendored as git submodules under lib/ via `forge install`
+
+# Env / secrets
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.log
