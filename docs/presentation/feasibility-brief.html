@@ -129,6 +129,7 @@
    .who.user{background:#0f2417;color:#5fd877;border:1px solid #1f5132}
    .who.any{background:#2b2440;color:#c4a5ff;border:1px solid #43356b}
    .who.none{background:var(--panel2);color:var(--dim);border:1px solid var(--line)}
+   table td.grp{background:var(--panel2);color:var(--muted);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
    .s-init{border-left-color:var(--dim)} .s-lps{border-left-color:var(--accent)}
    .s-fail{border-left-color:var(--amber)} .s-epoch{border-left-color:var(--green)}
    .s-wind{border-left-color:var(--violet)} .s-closed{border-left-color:var(--dim)}
@@ -158,6 +159,7 @@
   <a href="#why">Why Alt-1</a>
   <a href="#how">How it works</a>
   <a href="#flow">Money flow</a>
+  <a href="#api">Functions</a>
   <a href="#proof">8 Scenarios</a>
   <a href="#run">See it run</a>
   <a href="#tech">Under the hood</a>
@@ -327,6 +329,50 @@
       <p style="color:var(--dim);font-size:12.5px;margin-top:8px">Each layer fires only if the one above is exhausted. (Scenarios S5, S6.)</p>
     </div>
   </div>
+
+  <h3 style="font-size:17px;margin:24px 0 4px">Custody: where the assets actually move</h3>
+  <p style="color:var(--muted);font-size:14px;margin:0 0 8px"><b>Vault holds state; Custody holds tokens.</b> Every external token move is one of four Custody calls (onlyVault). Idle USDC is converted into the two sleeves on the way in, and back into USDC on the way out.</p>
+  <pre style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px 16px;font-size:12.5px;color:var(--ink);overflow:auto;line-height:1.55">
+ IN  (net subscription)                          OUT (net redemption)
+ ----------------------                          --------------------
+ idle USDC - subscribeToPruv  -&gt; wRWA   (~80%)    wRWA   - redeemFromPruv   -&gt; USDC
+ idle USDC - swapUSDCForLiquid -&gt; liquid (~20%)    liquid - swapLiquidForUSDC -&gt; USDC
+
+ totalAssets() = wRWA (x Pruv price) + liquid     both valued in 6-dec USDC</pre>
+  <p style="color:var(--dim);font-size:12.5px;margin-top:2px">On a net subscription the vault buys the under-allocated sleeve first (rebalance toward 80/20). On a net redemption it sells in the 3-layer order above: liquid before fund.</p>
+</div></section>
+
+<section id="api"><div class="wrap">
+  <h2>The main functions <span class="tag tech">Tech</span></h2>
+  <p class="lead">The public surface, grouped by phase. User calls are permissionless; admin calls are the single owner; Custody calls are internal (onlyVault). Tags: <span class="who admin">ADMIN</span> <span class="who user">USER</span> <span class="who any">ANYONE</span> <span class="who none">INTERNAL</span>.</p>
+  <table>
+    <tr><th>Function</th><th>Who</th><th>What it does</th></tr>
+    <tr><td colspan="3" class="grp">Setup &middot; Initialized</td></tr>
+    <tr><td><code>initLaunchpad</code></td><td><span class="who admin">ADMIN</span></td><td>Set the launchpad window (start/end) and the minimum raise.</td></tr>
+    <tr><td><code>configAsset</code></td><td><span class="who admin">ADMIN</span></td><td>Wire Pruv / liquid buffer / AMM and set the 80/20 target.</td></tr>
+    <tr><td colspan="3" class="grp">Launchpad</td></tr>
+    <tr><td><code>depositToLaunchpad</code></td><td><span class="who user">USER</span></td><td>Lock USDC into the raise.</td></tr>
+    <tr><td><code>transitionAfterDeadline</code></td><td><span class="who any">ANYONE</span></td><td>Settle the raise: if the minimum is met, buy 80/20 and go EpochBased; otherwise LaunchpadFail.</td></tr>
+    <tr><td><code>claimLaunchpadShares</code></td><td><span class="who user">USER</span></td><td>Mint your launch shares pro-rata (first epoch only).</td></tr>
+    <tr><td><code>refundLaunchpad</code></td><td><span class="who user">USER</span></td><td>Reclaim your USDC if the raise failed.</td></tr>
+    <tr><td colspan="3" class="grp">Epoch &middot; users</td></tr>
+    <tr><td><code>requestDeposit</code></td><td><span class="who user">USER</span></td><td>Queue USDC to be converted into shares at the next epoch.</td></tr>
+    <tr><td><code>requestRedeem</code></td><td><span class="who user">USER</span></td><td>Queue shares to be redeemed for USDC at the next epoch.</td></tr>
+    <tr><td><code>cancelRequest</code></td><td><span class="who user">USER</span></td><td>Cancel a still-pending request before the epoch processes (ERC-7887).</td></tr>
+    <tr><td><code>claim</code></td><td><span class="who user">USER</span></td><td>After the epoch, pull your minted shares or settled USDC to your wallet.</td></tr>
+    <tr><td colspan="3" class="grp">Settlement &middot; admin</td></tr>
+    <tr><td><code>setPrice</code> (Pruv)</td><td><span class="who admin">ADMIN</span></td><td>Submit the current NAV before each tick (manual price, see Under the hood).</td></tr>
+    <tr><td><code>processEpoch</code></td><td><span class="who admin">ADMIN</span></td><td>The tick: match P2P, rebalance / source assets, settle both queues, then epoch + 1.</td></tr>
+    <tr><td><code>triggerWindDown</code></td><td><span class="who admin">ADMIN</span></td><td>Start the one-way orderly shutdown.</td></tr>
+    <tr><td colspan="3" class="grp">Custody &middot; internal (onlyVault)</td></tr>
+    <tr><td><code>subscribeToPruv</code></td><td><span class="who none">INTERNAL</span></td><td>Convert idle USDC into wRWA (buy the illiquid sleeve).</td></tr>
+    <tr><td><code>redeemFromPruv</code></td><td><span class="who none">INTERNAL</span></td><td>Convert wRWA back into USDC (sell illiquid, the last-resort layer).</td></tr>
+    <tr><td><code>swapUSDCForLiquid</code> / <code>swapLiquidForUSDC</code></td><td><span class="who none">INTERNAL</span></td><td>Swap between idle USDC and the liquid buffer (1:1 via the mock AMM).</td></tr>
+    <tr><td><code>depositUSDC</code> / <code>withdrawUSDC</code></td><td><span class="who none">INTERNAL</span></td><td>Move USDC into or out of custody.</td></tr>
+    <tr><td colspan="3" class="grp">Views</td></tr>
+    <tr><td><code>state</code> &middot; <code>nav</code> &middot; <code>totalAssets</code> &middot; <code>currentEpoch</code></td><td><span class="who any">READ</span></td><td>Lifecycle state, price per share, assets in custody (6-dec USDC), epoch counter.</td></tr>
+    <tr><td><code>pendingSubAmount</code> &middot; <code>pendingRedeemShares</code></td><td><span class="who any">READ</span></td><td>A user's not-yet-settled deposit USDC / redeem shares.</td></tr>
+  </table>
 </div></section>
 
 <section id="proof"><div class="wrap">
