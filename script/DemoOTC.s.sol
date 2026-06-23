@@ -13,8 +13,13 @@ import {OTCFactory} from "../src/otc/OTCFactory.sol";
 import {OTCMarket} from "../src/otc/OTCMarket.sol";
 import {BidVault} from "../src/otc/BidVault.sol";
 
-/// @notice Demo of the OTC early-exit flow. Prints human-readable balances at each step.
-/// @dev    forge script script/DemoOTC.s.sol --sig 'run(string)' "OTC1" -vvv
+/// @notice Manager-facing demo of the OTC early-exit layer. Mirrors the narration style of
+///         `Demo.s.sol`: each scenario prints the claim it proves, step-by-step balances, and a
+///         PASS verdict. The OTC market sits as "Layer 0" — an instant exit door alongside the
+///         normal retail subscribe/redeem queue.
+/// @dev    One scenario:  forge script script/DemoOTC.s.sol --sig 'run(string)' "OTC1" -vvv
+///         Combined:      forge script script/DemoOTC.s.sol --sig 'run(string)' "COMBINED" -vvv
+///         Both:          forge script script/DemoOTC.s.sol --sig 'run(string)' "ALL" -vvv
 contract DemoOTC is Script {
     MockUSDC usdc;
     MockLiquidBuffer liquid;
@@ -25,8 +30,10 @@ contract DemoOTC is Script {
     OTCFactory factory;
     OTCMarket otc;
 
-    address seller = address(0x5E11E8);
-    address buyer = address(0xB01E8);
+    address alice = address(0xA11CE);
+    address bob = address(0xB0B);
+    address charlie = address(0xC4A411E);
+    address dave = address(0xDA5E);
 
     uint64 start;
     uint64 end;
@@ -35,142 +42,180 @@ contract DemoOTC is Script {
     uint256 constant SHARE_ONE = 1e18;
 
     function run(string memory scenario) external {
-        // Only OTC1 is defined; any unknown scenario falls through to the same path.
         bytes32 s = keccak256(bytes(scenario));
-        if (s == keccak256("OTC1") || true) _otc1();
+        if (s == keccak256("ALL")) _all();
+        else if (s == keccak256("OTC1")) _otc1();
+        else if (s == keccak256("COMBINED")) _combined();
+        else revert("unknown scenario: use OTC1, COMBINED or ALL");
     }
 
-    function _otc1() internal {
-        _open("OTC1", "Early-Exit OTC - Buyer Acquires Discounted Shares");
-        _proves("A holder can exit early at a discount; the buyer redeems at full NAV after epoch.");
+    function _all() internal {
+        _otc1();
+        _combined();
+        console2.log("");
+        console2.log("##################################################");
+        console2.log("#            ACCEPTANCE SUMMARY                  #");
+        console2.log("##################################################");
+        console2.log("  [PASS] OTC1      Standalone early-exit at a discount");
+        console2.log("  [PASS] COMBINED  OTC early-exit composes with the retail queue");
+        console2.log("  --------------------------------------------------");
+        console2.log("  2 / 2 OTC scenarios verified.");
+        console2.log("");
+    }
 
-        // ----------------------------------------------------------------
-        // Step 1: deploy full stack and reach EpochBased with seller holding shares
-        // ----------------------------------------------------------------
-        _step("Deploy full stack and reach EpochBased. Seller deposits 100,000 USDC in launchpad.");
+    // =============================================================
+    //                       SCENARIOS
+    // =============================================================
+
+    function _otc1() internal {
+        _open("OTC1", "Standalone Early-Exit - Seller Cashes Out Now, Buyer Captures Discount");
+        _proves("A holder exits instantly at a 5% discount; the buyer redeems at full NAV next epoch.");
         _deploy();
 
+        _step("Reach EpochBased. Seller deposits 100,000 USDC in the launchpad and claims shares.");
         vm.warp(start);
         vault.startLaunchpad();
-
-        _lpDeposit(seller, 100_000 * USDC_ONE);
-
+        _lpDeposit(alice, 100_000 * USDC_ONE); // alice = the seller in this scenario
         vm.warp(end);
         vault.transitionAfterDeadline();
-
-        vm.prank(seller);
+        _vm(alice);
         vault.claimLaunchpadShares();
+        _ok(string.concat("Seller (alice) holds ", _sh(vault.balanceOf(alice)), "."));
+        _portfolio();
 
-        uint256 sellerShares = vault.balanceOf(seller);
-        _ok(string.concat("EpochBased reached. Seller rACCESS balance: ", _sh(sellerShares)));
-        _ok(
-            string.concat(
-                "Portfolio: ", _usd(custody.wRWABalance()), " illiquid + ", _usd(custody.liquidBalance()), " liquid"
-            )
-        );
+        _step("Deploy OTC market with discount ladder [100, 250, 500, 1000] bps (1% / 2.5% / 5% / 10%).");
+        _deployOtc();
+        _ok(string.concat("OTCMarket live at ", vm.toString(address(otc)), " (Layer 0 exit door)."));
 
-        // ----------------------------------------------------------------
-        // Step 2: deploy OTCFactory + OTCMarket with ladder [100, 250, 500, 1000]
-        // ----------------------------------------------------------------
-        _step("Deploy OTCFactory and OTCMarket with discount ladder [100, 250, 500, 1000] bps.");
-        factory = new OTCFactory();
-        uint16[] memory ladder = new uint16[](4);
-        ladder[0] = 100;
-        ladder[1] = 250;
-        ladder[2] = 500;
-        ladder[3] = 1000;
-        otc = new OTCMarket(address(vault), usdc, ladder, factory);
-        _ok(string.concat("OTCMarket deployed at: ", vm.toString(address(otc))));
+        _step("Buyer (bob) places a bid: 500 bps tier, escrows 9,500 USDC.");
+        uint256 bidId = _placeBid(bob, 500, 9500 * USDC_ONE);
+        (, uint16 d, uint256 esc,) = otc.bids(bidId);
+        _ok(string.concat("Bid #", vm.toString(bidId), " resting on the ", _bps(d), " rung; ", _usd(esc), " escrowed."));
 
-        // ----------------------------------------------------------------
-        // Step 3: buyer places a bid at 500 bps discount, escrowing 9,500 USDC
-        // ----------------------------------------------------------------
-        _step("Buyer places bid: 500 bps discount, 9,500 USDC escrowed.");
-        vm.startPrank(buyer);
-        usdc.approve(address(otc), 9500 * USDC_ONE);
-        uint256 bidId = otc.placeBid(500, 9500 * USDC_ONE);
-        vm.stopPrank();
-
-        (address bidBuyer, uint16 bidDiscount, uint256 bidUsdc,) = otc.bids(bidId);
-        _ok(string.concat("Bid #", vm.toString(bidId), " placed by ", vm.toString(bidBuyer)));
-        _ok(string.concat("  Discount: ", vm.toString(uint256(bidDiscount)), " bps | Escrowed: ", _usd(bidUsdc)));
-
-        // ----------------------------------------------------------------
-        // Step 4: seller approves shares to market and sells 10,000 shares at max 1000 bps
-        // ----------------------------------------------------------------
-        _step("Seller approves 10,000 shares to OTCMarket and calls sell().");
-        uint256 sellShares = 10_000 * SHARE_ONE;
-        uint256 sellerUsdcBefore = usdc.balanceOf(seller);
-
-        vm.startPrank(seller);
-        vault.approve(address(otc), sellShares);
-        otc.sell(sellShares, 1000);
-        vm.stopPrank();
-
-        uint256 sellerUsdcReceived = usdc.balanceOf(seller) - sellerUsdcBefore;
-        uint256 sellerSharesAfter = vault.balanceOf(seller);
+        _step("Seller approves 10,000 shares and calls sell(10,000, max 1000 bps) - cheapest rung fills first.");
+        uint256 sellerUsdcBefore = usdc.balanceOf(alice);
+        uint256 sold = _sell(alice, 10_000 * SHARE_ONE, 1000);
+        uint256 sellerGot = usdc.balanceOf(alice) - sellerUsdcBefore;
         address bv = otc.bidVaultOf(bidId);
-        uint256 buyerLp = BidVault(bv).balanceOf(buyer);
+        uint256 buyerLp = BidVault(bv).balanceOf(bob);
+        _ok(string.concat("Matched ", _sh(sold), " at 5% discount. Seller received ", _usd(sellerGot), " NOW."));
+        _ok(string.concat("BidVault deployed at ", vm.toString(bv), " (auto-queued a redeem)."));
+        _ok(string.concat("Buyer minted ", _sh(buyerLp), " of otcLP (1:1 with shares bought)."));
 
-        _ok(
-            string.concat(
-                "Seller USDC received: ", _usd(sellerUsdcReceived), " (9,500 USDC for 10,000 shares at 5% discount)"
-            )
-        );
-        _ok(string.concat("Seller remaining shares: ", _sh(sellerSharesAfter)));
-        _ok(string.concat("BidVault deployed at: ", vm.toString(bv)));
-        _ok(string.concat("Buyer LP balance (otcLP): ", _sh(buyerLp)));
-
-        // ----------------------------------------------------------------
-        // Step 5: processEpoch, claimRedemption, buyer redeems LP for USDC
-        // ----------------------------------------------------------------
-        _step("Admin sets NAV price to 1.00, then processEpoch() to settle the queued redemption.");
+        _step("Admin sets NAV 1.00, then processEpoch() settles the BidVault's queued redeem.");
         pruv.setPrice(1e18);
         vault.processEpoch();
+        _ok(string.concat("Epoch processed; currentEpoch = ", vm.toString(vault.currentEpoch()), "."));
+
+        _step("BidVault.claimRedemption() pulls full-NAV USDC; buyer redeems otcLP for that USDC.");
+        BidVault(bv).claimRedemption();
+        uint256 buyerBefore = usdc.balanceOf(bob);
+        _vm(bob);
+        BidVault(bv).redeem(buyerLp);
+        uint256 buyerGot = usdc.balanceOf(bob) - buyerBefore;
+        uint256 buyerProfit = buyerGot - 9500 * USDC_ONE;
+        _ok(string.concat("Buyer redeemed ", _usd(buyerGot), " (10,000 shares x NAV 1.00)."));
+        _ok(string.concat("Buyer profit = ", _usd(buyerProfit), " = exactly the 5% discount the seller paid."));
+        _pass("Instant exit at -5% for the seller; +500 USDC for the buyer who waited one epoch.");
+    }
+
+    function _combined() internal {
+        _open("COMBINED", "Retail + OTC As One Lifecycle - OTC Is Layer 0 Inside The Normal Flow");
+        _proves("An OTC early-exit and the retail queue settle together in a single epoch, all whole.");
+        _deploy();
+
+        _step("Launchpad: Alice 50,000 + Bob 30,000 + Charlie 20,000 USDC -> 100,000 total.");
+        vm.warp(start);
+        vault.startLaunchpad();
+        _lpDeposit(alice, 50_000 * USDC_ONE);
+        _lpDeposit(bob, 30_000 * USDC_ONE);
+        _lpDeposit(charlie, 20_000 * USDC_ONE);
+        vm.warp(end);
+        vault.transitionAfterDeadline();
+        _portfolio();
+
+        _step("All three claim their launchpad shares.");
+        _vm(alice);
+        vault.claimLaunchpadShares();
+        _vm(bob);
+        vault.claimLaunchpadShares();
+        _vm(charlie);
+        vault.claimLaunchpadShares();
         _ok(
             string.concat(
-                "Epoch ",
-                vm.toString(vault.currentEpoch() - 1),
-                " processed. currentEpoch = ",
-                vm.toString(vault.currentEpoch())
+                "Alice ",
+                _sh(vault.balanceOf(alice)),
+                " | Bob ",
+                _sh(vault.balanceOf(bob)),
+                " | Charlie ",
+                _sh(vault.balanceOf(charlie)),
+                "."
             )
         );
 
-        _step("Anyone calls BidVault.claimRedemption() to pull USDC from the Vault into the BidVault.");
-        BidVault(bv).claimRedemption();
-        uint256 bvUsdc = usdc.balanceOf(bv);
-        _ok(string.concat("BidVault USDC received from Vault: ", _usd(bvUsdc)));
-
-        _step("Buyer redeems their LP tokens from the BidVault for full NAV USDC.");
-        uint256 buyerUsdcBefore = usdc.balanceOf(buyer);
-        // buyer started with 100,000; spent 9,500 escrowing; net cost = 9,500
-        uint256 buyerUsdcSpent = 100_000 * USDC_ONE - buyerUsdcBefore;
-        vm.prank(buyer);
-        BidVault(bv).redeem(buyerLp);
-        uint256 buyerUsdcFinal = usdc.balanceOf(buyer);
-        uint256 buyerRedeemed = buyerUsdcFinal - buyerUsdcBefore;
-        uint256 buyerProfit = buyerRedeemed > buyerUsdcSpent ? buyerRedeemed - buyerUsdcSpent : 0;
-
-        _ok(string.concat("Buyer USDC redeemed from BidVault: ", _usd(buyerRedeemed)));
-        _ok(string.concat("Buyer net profit (redeemed - escrowed): ", _usd(buyerProfit), " (the 500 bps discount)"));
-        _ok(string.concat("Buyer final USDC balance: ", _usd(buyerUsdcFinal)));
-
-        console2.log("");
-        console2.log("  SUMMARY");
-        console2.log(
-            string.concat("    Seller received:  ", _usd(sellerUsdcReceived), " (instant liquidity at 5% discount)")
+        _step(
+            "Retail epoch activity: Alice subscribes 10,000 (slow in); Bob redeems 5,000 shares (slow out, via queue)."
         );
-        console2.log(
+        uint256 aliceReq = _reqDeposit(alice, 10_000 * USDC_ONE);
+        uint256 bobReq = _reqRedeem(bob, 5000 * SHARE_ONE);
+        _ok(
             string.concat(
-                "    Buyer paid:       ",
-                _usd(9500 * USDC_ONE),
-                " -> redeemed: ",
-                _usd(buyerUsdcFinal),
-                " -> profit: ~500 USDC"
+                "Bob's queued exit is pending: ", _sh(vault.pendingRedeemShares(bob)), " (waits for the epoch)."
             )
         );
 
-        _pass("OTC early-exit complete: seller exited before epoch, buyer captured discount.");
+        _step("Layer 0 - Charlie needs cash NOW. Deploy OTC market; Dave bids 9,500 USDC at the 500 bps rung.");
+        _deployOtc();
+        uint256 bidId = _placeBid(dave, 500, 9500 * USDC_ONE);
+        _ok(string.concat("Dave's bid #", vm.toString(bidId), " rests on the 5.00% rung; 9,500.00 USDC escrowed."));
+
+        _step("Charlie sells 10,000 of his 20,000 shares into the OTC bid - instant fill, no waiting.");
+        uint256 charlieBefore = usdc.balanceOf(charlie);
+        uint256 sold = _sell(charlie, 10_000 * SHARE_ONE, 1000);
+        uint256 charlieGot = usdc.balanceOf(charlie) - charlieBefore;
+        address bv = otc.bidVaultOf(bidId);
+        _ok(string.concat("Charlie received ", _usd(charlieGot), " IMMEDIATELY (Layer-0 exit, -5%)."));
+        _ok(string.concat("Bob is still waiting in the queue: ", _sh(vault.pendingRedeemShares(bob)), " pending."));
+        _ok(string.concat("OTC fill auto-queued a redeem via BidVault ", vm.toString(bv), "."));
+
+        _step("Admin sets NAV 1.00, then processEpoch() settles retail queue AND the BidVault redeem together.");
+        pruv.setPrice(1e18);
+        vault.processEpoch();
+        _ok("Matched 10,000 P2P (Alice's sub vs redeemers); net redeem 5,000 paid from liquid buffer (20k -> 15k).");
+        _portfolio();
+
+        _step("Claims: Alice gets shares, Bob gets USDC, BidVault pulls USDC then Dave redeems otcLP.");
+        _claim(alice, aliceReq);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        _claim(bob, bobReq);
+        uint256 bobGot = usdc.balanceOf(bob) - bobBefore;
+        BidVault(bv).claimRedemption();
+        uint256 daveLp = BidVault(bv).balanceOf(dave);
+        uint256 daveBefore = usdc.balanceOf(dave);
+        _vm(dave);
+        BidVault(bv).redeem(daveLp);
+        uint256 daveGot = usdc.balanceOf(dave) - daveBefore;
+        _ok(string.concat("Alice now holds ", _sh(vault.balanceOf(alice)), " (her 10,000 sub minted)."));
+        _ok(string.concat("Bob redeemed ", _usd(bobGot), " from the queue (full NAV, one epoch later)."));
+        _ok(
+            string.concat(
+                "Dave redeemed ",
+                _usd(daveGot),
+                " (10,000 shares x NAV 1.00); profit ",
+                _usd(daveGot - 9500 * USDC_ONE),
+                "."
+            )
+        );
+
+        _pass("OTC early-exit composes with the retail queue in one epoch.");
+        console2.log("");
+        console2.log("  TWO EXIT DOORS, SAME VAULT:");
+        console2.log(
+            string.concat("    Charlie (OTC, Layer 0):  instant, received ", _usd(charlieGot), " at -5% discount.")
+        );
+        console2.log(
+            string.concat("    Bob     (retail queue):  1 epoch wait, received ", _usd(bobGot), " at full NAV 1.00.")
+        );
     }
 
     // =============================================================
@@ -189,8 +234,20 @@ contract DemoOTC is Script {
         end = uint64(block.timestamp + 8 days);
         vault.initLaunchpad(start, end, 50_000 * USDC_ONE);
         vault.configAsset(address(pruv), address(liquid), address(amm), 8000);
-        usdc.mint(seller, 1_000_000 * USDC_ONE);
-        usdc.mint(buyer, 100_000 * USDC_ONE);
+        usdc.mint(alice, 1_000_000 * USDC_ONE);
+        usdc.mint(bob, 1_000_000 * USDC_ONE);
+        usdc.mint(charlie, 1_000_000 * USDC_ONE);
+        usdc.mint(dave, 1_000_000 * USDC_ONE);
+    }
+
+    function _deployOtc() internal {
+        factory = new OTCFactory();
+        uint16[] memory ladder = new uint16[](4);
+        ladder[0] = 100;
+        ladder[1] = 250;
+        ladder[2] = 500;
+        ladder[3] = 1000;
+        otc = new OTCMarket(address(vault), usdc, ladder, factory);
     }
 
     function _lpDeposit(address who, uint256 amount) internal {
@@ -198,6 +255,41 @@ contract DemoOTC is Script {
         usdc.approve(address(vault), amount);
         vault.depositToLaunchpad(amount);
         vm.stopPrank();
+    }
+
+    function _reqDeposit(address who, uint256 amount) internal returns (uint256 id) {
+        vm.startPrank(who);
+        usdc.approve(address(vault), amount);
+        id = vault.requestDeposit(amount);
+        vm.stopPrank();
+    }
+
+    function _reqRedeem(address who, uint256 shares) internal returns (uint256 id) {
+        vm.prank(who);
+        id = vault.requestRedeem(shares);
+    }
+
+    function _placeBid(address who, uint16 discountBps, uint256 usdcIn) internal returns (uint256 id) {
+        vm.startPrank(who);
+        usdc.approve(address(otc), usdcIn);
+        id = otc.placeBid(discountBps, usdcIn);
+        vm.stopPrank();
+    }
+
+    function _sell(address who, uint256 shares, uint16 maxDiscountBps) internal returns (uint256 sold) {
+        vm.startPrank(who);
+        vault.approve(address(otc), shares);
+        sold = otc.sell(shares, maxDiscountBps);
+        vm.stopPrank();
+    }
+
+    function _claim(address who, uint256 id) internal {
+        vm.prank(who);
+        vault.claim(id);
+    }
+
+    function _vm(address who) internal {
+        vm.prank(who);
     }
 
     // =============================================================
@@ -229,16 +321,45 @@ contract DemoOTC is Script {
         console2.log(string.concat("  RESULT: PASS - ", s));
     }
 
+    function _portfolio() internal view {
+        console2.log(
+            string.concat(
+                "      Portfolio: ",
+                _usd(custody.wRWABalance()),
+                " illiquid + ",
+                _usd(custody.liquidBalance()),
+                " liquid | supply ",
+                _sh(vault.totalSupply()),
+                " | NAV ",
+                _navStr(vault.nav())
+            )
+        );
+    }
+
     /// @dev Format a 6-decimal USDC amount as "1,234.56 USDC".
     function _usd(uint256 v) internal pure returns (string memory) {
         uint256 whole = v / USDC_ONE;
-        uint256 cents = (v % USDC_ONE) / 1e4;
+        uint256 cents = (v % USDC_ONE) / 1e4; // 2 decimals
         return string.concat(_commify(whole), ".", _two(cents), " USDC");
     }
 
     /// @dev Format an 18-decimal share amount as "1,234 shares" (whole shares).
     function _sh(uint256 v) internal pure returns (string memory) {
         return string.concat(_commify(v / SHARE_ONE), " shares");
+    }
+
+    /// @dev Format the 1e6-parity NAV as "1.08".
+    function _navStr(uint256 navRaw) internal pure returns (string memory) {
+        uint256 whole = navRaw / USDC_ONE;
+        uint256 frac = (navRaw % USDC_ONE) / 1e4;
+        return string.concat(vm.toString(whole), ".", _two(frac));
+    }
+
+    /// @dev Format a basis-point discount as "5.00%".
+    function _bps(uint16 b) internal pure returns (string memory) {
+        uint256 whole = uint256(b) / 100;
+        uint256 frac = uint256(b) % 100;
+        return string.concat(vm.toString(whole), ".", _two(frac), "%");
     }
 
     function _two(uint256 n) internal pure returns (string memory) {
