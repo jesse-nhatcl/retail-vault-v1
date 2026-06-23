@@ -114,4 +114,24 @@ contract OTCMarketTest is OTCFixture {
         vm.expectRevert(); // InvalidLadder
         new OTCMarket(address(vault), usdc, bad);
     }
+
+    function test_CloseForWindDown_RefundsOpenBids() public {
+        _placeBid(bob, 500, 1000e6);
+        _placeBid(charlie, 1000, 2000e6);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        uint256 charlieBefore = usdc.balanceOf(charlie);
+
+        vault.triggerWindDown();
+        otc.closeForWindDown();
+
+        assertEq(usdc.balanceOf(bob), bobBefore + 1000e6);
+        assertEq(usdc.balanceOf(charlie), charlieBefore + 2000e6);
+        assertEq(usdc.balanceOf(address(otc)), 0);
+    }
+
+    function test_Revert_CloseForWindDown_WhileOpen() public {
+        _placeBid(bob, 500, 1000e6);
+        vm.expectRevert(); // StillOpen — vault is still EpochBased
+        otc.closeForWindDown();
+    }
 }

@@ -12,6 +12,7 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 /// @notice See docs/07-otc-early-exit-alt1-1a-breakdown.md. Phase 0: swaps shares straight to buyers.
 contract OTCMarket is IOTCMarket, ReentrancyGuard {
     error InvalidLadder();
+    error StillOpen();
     using SafeERC20 for IERC20;
 
     uint256 internal constant MAX_SCAN = 100; // gas bound, mirrors Vault's per-epoch cap
@@ -144,8 +145,21 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         emit Sold(msg.sender, sharesSold, usdcToSeller, remaining);
     }
 
-    /// @notice Close the market and refund all resting bids when vault enters WindDown. Not yet implemented.
-    function closeForWindDown() external {
-        revert MarketClosed(); // implemented in a later task
+    /// @notice After the vault leaves EpochBased, refund every resting bid. Permissionless, idempotent.
+    function closeForWindDown() external nonReentrant {
+        if (vault.state() == IVault.State.EpochBased) revert StillOpen();
+        uint256 count;
+        uint256 n = bids.length;
+        for (uint256 i = 0; i < n && i < MAX_SCAN; i++) {
+            Bid storage b = bids[i];
+            if (b.status == BidStatus.Resting && b.usdcRemaining > 0) {
+                uint256 refund = b.usdcRemaining;
+                b.usdcRemaining = 0;
+                b.status = BidStatus.Cancelled;
+                usdc.safeTransfer(b.buyer, refund);
+                count++;
+            }
+        }
+        emit MarketClosedForWindDown(count);
     }
 }
