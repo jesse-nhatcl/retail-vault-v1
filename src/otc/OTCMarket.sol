@@ -84,9 +84,55 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         emit BidCancelled(bidId, refund);
     }
 
-    /// @notice Sell shares into resting bids, cheapest discount first. Not yet implemented.
-    function sell(uint256, uint16) external returns (uint256) {
-        revert NoFill(); // implemented in a later task
+    /// @notice Shares (18-dec) that `usdcIn` (6-dec) buys at `discountBps` off the current NAV.
+    function _sharesForUsdc(uint256 usdcIn, uint16 discountBps, uint256 navNow) internal pure returns (uint256) {
+        uint256 atNav = Math.mulDiv(usdcIn, 1e18, navNow);
+        return Math.mulDiv(atNav, BPS, BPS - discountBps);
+    }
+
+    /// @notice Sell shares into resting bids, sweeping cheapest discount first.
+    /// @param shares Amount of shares (18-dec) to sell.
+    /// @param maxDiscountBps Maximum discount tier the seller accepts (bids above this are skipped).
+    /// @return sharesSold Shares successfully matched and transferred to buyers.
+    function sell(uint256 shares, uint16 maxDiscountBps) external nonReentrant marketOpen returns (uint256 sharesSold) {
+        if (shares == 0) revert ZeroAmount();
+        shareToken.safeTransferFrom(msg.sender, address(this), shares);
+
+        uint256 navNow = vault.nav();
+        uint256 remaining = shares;
+        uint256 usdcToSeller;
+        uint256 scanned;
+
+        for (uint256 t = 0; t < _ladder.length && remaining > 0; t++) {
+            uint16 d = _ladder[t];
+            if (d > maxDiscountBps) break;
+            uint256[] storage q = _book[d];
+            for (uint256 i = 0; i < q.length && remaining > 0; i++) {
+                if (scanned++ >= MAX_SCAN) break;
+                Bid storage b = bids[q[i]];
+                if (b.status != BidStatus.Resting || b.usdcRemaining == 0) continue;
+
+                uint256 bidShares = _sharesForUsdc(b.usdcRemaining, d, navNow);
+                uint256 fill = bidShares < remaining ? bidShares : remaining;
+                uint256 usdcPaid = Math.mulDiv(b.usdcRemaining, fill, bidShares);
+
+                b.usdcRemaining -= usdcPaid;
+                if (fill == bidShares) b.status = BidStatus.Matched;
+                remaining -= fill;
+                usdcToSeller += usdcPaid;
+
+                shareToken.safeTransfer(b.buyer, fill);
+                emit BidFilled(q[i], b.buyer, fill, usdcPaid);
+            }
+        }
+
+        if (usdcToSeller == 0) revert NoFill();
+
+        sharesSold = shares - remaining;
+        if (remaining > 0) shareToken.safeTransfer(msg.sender, remaining);
+        usdc.safeTransfer(msg.sender, usdcToSeller);
+
+        emit Sold(msg.sender, sharesSold, usdcToSeller, remaining);
     }
 
     /// @notice Close the market and refund all resting bids when vault enters WindDown. Not yet implemented.
