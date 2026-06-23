@@ -11,6 +11,7 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 
 /// @notice See docs/07-otc-early-exit-alt1-1a-breakdown.md. Phase 0: swaps shares straight to buyers.
 contract OTCMarket is IOTCMarket, ReentrancyGuard {
+    error InvalidLadder();
     using SafeERC20 for IERC20;
 
     uint256 internal constant MAX_SCAN = 100; // gas bound, mirrors Vault's per-epoch cap
@@ -27,10 +28,13 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
     mapping(uint16 => uint256[]) internal _book; // discountBps -> FIFO bidIds
 
     constructor(address vault_, MockUSDC usdc_, uint16[] memory ladder_) {
+        if (ladder_.length == 0) revert InvalidLadder();
         vault = IVault(vault_);
         shareToken = IERC20(vault_);
         usdc = IERC20(address(usdc_));
         for (uint256 i = 0; i < ladder_.length; i++) {
+            if (ladder_[i] >= BPS) revert InvalidLadder();
+            if (i > 0 && ladder_[i] <= ladder_[i - 1]) revert InvalidLadder();
             _ladder.push(ladder_[i]);
             onLadder[ladder_[i]] = true;
         }
@@ -102,15 +106,19 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         uint256 remaining = shares;
         uint256 usdcToSeller;
         uint256 scanned;
+        bool capped;
 
         for (uint256 t = 0; t < _ladder.length && remaining > 0; t++) {
             uint16 d = _ladder[t];
             if (d > maxDiscountBps) break;
             uint256[] storage q = _book[d];
             for (uint256 i = 0; i < q.length && remaining > 0; i++) {
-                if (scanned++ >= MAX_SCAN) break;
                 Bid storage b = bids[q[i]];
                 if (b.status != BidStatus.Resting || b.usdcRemaining == 0) continue;
+                if (scanned++ >= MAX_SCAN) {
+                    capped = true;
+                    break;
+                }
 
                 uint256 bidShares = _sharesForUsdc(b.usdcRemaining, d, navNow);
                 uint256 fill = bidShares < remaining ? bidShares : remaining;
@@ -124,6 +132,7 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
                 shareToken.safeTransfer(b.buyer, fill);
                 emit BidFilled(q[i], b.buyer, fill, usdcPaid);
             }
+            if (capped) break;
         }
 
         if (usdcToSeller == 0) revert NoFill();

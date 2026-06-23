@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {OTCFixture} from "../helpers/OTCFixture.sol";
 import {IOTCMarket} from "../../src/interfaces/IOTCMarket.sol";
+import {OTCMarket} from "../../src/otc/OTCMarket.sol";
 
 contract OTCMarketTest is OTCFixture {
     function setUp() public {
@@ -104,5 +105,13 @@ contract OTCMarketTest is OTCFixture {
         vm.expectRevert(IOTCMarket.NoFill.selector);
         otc.sell(1000e18, 500); // floor 5% -> 10% bid too expensive
         vm.stopPrank();
+    }
+
+    function test_Revert_ConstructorUnsortedLadder() public {
+        uint16[] memory bad = new uint16[](2);
+        bad[0] = 500;
+        bad[1] = 100; // not ascending
+        vm.expectRevert(); // InvalidLadder
+        new OTCMarket(address(vault), usdc, bad);
     }
 }
