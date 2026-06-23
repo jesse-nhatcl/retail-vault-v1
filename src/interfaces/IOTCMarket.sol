@@ -24,7 +24,6 @@ interface IOTCMarket {
     error BidNotResting();
     error MarketClosed(); // vault not in EpochBased
     error NoFill(); // sell() matched nothing at/under the floor
-    error TooManyBids();
 
     event BidPlaced(uint256 indexed bidId, address indexed buyer, uint16 discountBps, uint256 usdcIn);
     event BidCancelled(uint256 indexed bidId, uint256 usdcRefunded);

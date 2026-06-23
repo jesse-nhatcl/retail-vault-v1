@@ -17,6 +17,9 @@ interface IBidVault {
     function initRedeem() external;
     /// @notice Pull the settled USDC payout from the Vault after the epoch processes.
     function claimRedemption() external;
+    /// @notice Recover value via the Vault's pro-rata wind-down pool when wind-down cancelled the
+    ///         auto-redeem and returned the shares to this vault.
+    function claimWindDown() external;
     /// @notice Burn `lp` LP tokens for a pro-rata share of the USDC this vault has received.
     function redeem(uint256 lp) external returns (uint256 usdcOut);
 }

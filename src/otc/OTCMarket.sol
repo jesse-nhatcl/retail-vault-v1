@@ -64,10 +64,10 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         return _book[discountBps];
     }
 
-    /// @notice Sum of escrowed USDC still owed to resting bids (bounded scan).
+    /// @notice Sum of escrowed USDC still owed to resting bids. View only; sums all bids.
     function totalEscrowed() external view returns (uint256 sum) {
         uint256 n = bids.length;
-        for (uint256 i = 0; i < n && i < MAX_SCAN; i++) {
+        for (uint256 i = 0; i < n; i++) {
             if (bids[i].status == BidStatus.Resting) sum += bids[i].usdcRemaining;
         }
     }

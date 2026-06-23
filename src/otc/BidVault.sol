@@ -43,6 +43,13 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
         emit RedemptionClaimed(usdc.balanceOf(address(this)));
     }
 
+    /// @notice Recover value when wind-down cancelled the auto-redeem and returned the shares here:
+    ///         burn this vault's shares into the Vault's pro-rata wind-down pool so LP stays redeemable.
+    function claimWindDown() external nonReentrant {
+        vault.claimWindDown();
+        emit RedemptionClaimed(usdc.balanceOf(address(this)));
+    }
+
     /// @notice Burn LP for a pro-rata share of the USDC this vault has received.
     function redeem(uint256 lp) external nonReentrant returns (uint256 usdcOut) {
         if (lp == 0 || balanceOf(msg.sender) < lp) revert NothingToClaim();

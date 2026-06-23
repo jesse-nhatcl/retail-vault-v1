@@ -33,6 +33,7 @@ interface IVault {
     // ---- Admin / settlement ----
     function processEpoch() external;
     function triggerWindDown() external;
+    function claimWindDown() external;
 
     // ---- Views ----
     function state() external view returns (State);
