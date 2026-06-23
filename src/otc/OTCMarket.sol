@@ -11,7 +11,7 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {OTCFactory} from "./OTCFactory.sol";
 import {BidVault} from "./BidVault.sol";
 
-/// @notice See docs/07-otc-early-exit-alt1-1a-breakdown.md. Phase 0: swaps shares straight to buyers.
+/// @notice See docs/07-otc-early-exit-alt1-1a-breakdown.md. Each fill deploys a per-bid BidVault (ERC-4626-style LP) that auto-redeems the bought shares through the Vault.
 contract OTCMarket is IOTCMarket, ReentrancyGuard {
     error InvalidLadder();
     error StillOpen();
@@ -25,7 +25,8 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
     IERC20 public immutable usdc;
     OTCFactory public immutable factory;
 
-    mapping(uint256 => address) public bidVaultOf; // bidId -> last BidVault created for it
+    /// @dev bidId -> the last BidVault created for it. A bid filled across multiple sell() calls produces multiple BidVaults; only the latest is recorded here (earlier ones are discoverable via BidFilled/BidVaultCreated events). POC simplification.
+    mapping(uint256 => address) public bidVaultOf;
 
     uint16[] internal _ladder;
     mapping(uint16 => bool) public onLadder;
@@ -109,6 +110,7 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         return Math.mulDiv(atNav, BPS, BPS - discountBps);
     }
 
+    /// @dev Each fill creates one Vault redeem request; a single sell can consume up to MAX_SCAN of the Vault's shared per-epoch request slots (EpochQueueFull). Acceptable for the POC.
     /// @notice Sell shares into resting bids, sweeping cheapest discount first.
     /// @param shares Amount of shares (18-dec) to sell.
     /// @param maxDiscountBps Maximum discount tier the seller accepts (bids above this are skipped).

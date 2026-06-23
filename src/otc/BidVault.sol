@@ -34,6 +34,7 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
         if (redeemInitiated) revert AlreadyInitiated();
         redeemInitiated = true;
         redeemRequestId = vault.requestRedeem(shares);
+        emit RedeemInitiated(redeemRequestId);
     }
 
     /// @notice After the epoch settles, pull this vault's USDC payout from the Vault.
