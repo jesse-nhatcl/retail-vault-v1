@@ -52,9 +52,21 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         return _book[discountBps];
     }
 
-    /// @notice Place a resting bid at a discount tier. Not yet implemented.
-    function placeBid(uint16, uint256) external returns (uint256) {
-        revert ZeroAmount(); // implemented in a later task
+    /// @notice Place a resting bid at a discount tier. Escrows USDC into the contract.
+    /// @param discountBps The discount tier in basis points; must be on the fixed ladder.
+    /// @param usdcIn Amount of USDC to escrow (6-dec).
+    /// @return bidId The index of the newly created bid.
+    function placeBid(uint16 discountBps, uint256 usdcIn) external nonReentrant marketOpen returns (uint256 bidId) {
+        if (usdcIn == 0) revert ZeroAmount();
+        if (!onLadder[discountBps]) revert OffLadder(discountBps);
+
+        usdc.safeTransferFrom(msg.sender, address(this), usdcIn);
+
+        bidId = bids.length;
+        bids.push(Bid({buyer: msg.sender, discountBps: discountBps, usdcRemaining: usdcIn, status: BidStatus.Resting}));
+        _book[discountBps].push(bidId);
+
+        emit BidPlaced(bidId, msg.sender, discountBps, usdcIn);
     }
 
     /// @notice Cancel a resting bid and reclaim escrowed USDC. Not yet implemented.
