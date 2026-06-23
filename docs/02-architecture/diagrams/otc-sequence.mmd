@@ -1,0 +1,34 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    actor B as Buyer
+    actor S as Seller
+    participant M as OTCMarket
+    participant F as OTCFactory
+    participant V as BidVault
+    participant CV as Vault (core)
+    actor A as Admin
+
+    B->>M: placeBid(discountBps, usdcIn)
+    Note over M: USDC escrowed, bid rests on the ladder rung
+
+    S->>M: sell(shares, floor)
+    M->>CV: nav()
+    Note over M: sweep bids cheapest-first, up to floor (cap 100)
+    loop per matched bid
+        M->>S: pay USDC now (NAV less discount)
+        M->>F: createBidVault(buyer, fill)
+        F-->>V: deploy
+        M->>V: transfer filled shares
+        V->>B: mint LP 1:1
+        V->>CV: requestRedeem(fill)
+    end
+    M->>S: return unsold shares
+
+    A->>CV: processEpoch()
+    Note over CV: redeem settles at NAV
+
+    V->>CV: claimRedemption -> claim(requestId)
+    CV-->>V: USDC at NAV
+    B->>V: redeem(LP)
+    V-->>B: USDC at NAV (profit = the discount)
