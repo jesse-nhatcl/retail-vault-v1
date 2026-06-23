@@ -57,6 +57,14 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         return _book[discountBps];
     }
 
+    /// @notice Sum of escrowed USDC still owed to resting bids (bounded scan).
+    function totalEscrowed() external view returns (uint256 sum) {
+        uint256 n = bids.length;
+        for (uint256 i = 0; i < n && i < MAX_SCAN; i++) {
+            if (bids[i].status == BidStatus.Resting) sum += bids[i].usdcRemaining;
+        }
+    }
+
     /// @notice Place a resting bid at a discount tier. Escrows USDC into the contract.
     /// @param discountBps The discount tier in basis points; must be on the fixed ladder.
     /// @param usdcIn Amount of USDC to escrow (6-dec).
