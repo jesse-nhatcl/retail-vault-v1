@@ -164,6 +164,7 @@
   <a href="#run">See it run</a>
   <a href="#tech">Under the hood</a>
   <a href="#fees">Fee model</a>
+  <a href="#otc">OTC early-exit</a>
   <a href="#next">Scope &amp; next</a>
 </div></nav>
 
@@ -707,6 +708,102 @@ feeShares = feeAssets &times; totalSupply
   <h3 style="font-size:17px;margin:26px 0 4px">Two things to get right</h3>
   <div class="note risk"><b>The real risk: a performance fee on a manual NAV.</b> NAV is admin-submitted through setPrice. With a performance fee in place, an admin could push the price up to crystallize a phantom fee, then walk it back the next epoch, leaving holders with the loss and no refund. Precedented mitigations exist: a deviation bound on setPrice (Veda), an on-chain fee cap (Morpho and Lagoon cap at 50%), rates that can only fall after deploy (Lagoon), and a timelock on parameter changes. The root cause is the manual NAV, which is why this ties directly to the <code>INavSource</code> seam and the oracle decision.</div>
   <div class="note"><b>An implementation detail: charge flow fees on the gross of each request.</b> Entry and exit fees must be taken on each request before matching. Charging on the post-match net would let matched volume slip through untaxed. Stock fees (management and performance) are immune, because their base is the assets under management, which matching does not change.</div>
+</div></section>
+
+<section id="otc"><div class="wrap">
+  <h2>OTC early-exit, variant 1a <span class="tag both">Built &amp; proven extension</span></h2>
+  <p class="lead">A holder who wants out before the next epoch can sell shares to another retail buyer at a small discount and receive USDC immediately, instead of waiting a full epoch for the redemption queue. This is a Layer-0 market placed in front of the queue: whatever does not sell falls through to the queue and is paid at full NAV. It is implemented and tested on the same chain, 27 dedicated tests, with the core Vault and Custody left untouched.</p>
+
+  <h3 style="font-size:17px;margin:22px 0 4px">The problem it solves</h3>
+  <p style="color:var(--muted);font-size:14px">The base vault gives one way out: request a redemption and wait for the next <code>processEpoch</code> to settle at NAV. Correct, but slow. A seller who needs cash now has no faster door. The OTC layer adds that door: a peer buys the shares at a discount, the seller takes the discount as the price of immediacy, and the buyer earns it as yield once the shares redeem at full NAV.</p>
+
+  <h3 style="font-size:17px;margin:22px 0 4px">How it works</h3>
+  <p style="color:var(--muted);font-size:14px"><b>Buyer-first.</b> Buyers post resting bids with USDC escrowed, each at a rung of a fixed discount ladder (1%, 2.5%, 5%, 10%). A seller's single transaction reads the NAV, sweeps those bids cheapest-first up to a floor they choose, and settles atomically on-chain. No keeper and no off-chain matcher: the matching runs in the seller's own transaction, the same philosophy as <code>processEpoch</code>.</p>
+  <div class="flow">
+    <div class="flane">
+      <span class="ftag in">BUYER</span>
+      <div class="fnode">placeBid<small>USDC escrowed, ladder rung</small></div><span class="far">&rarr;</span>
+      <div class="fnode">resting bid<small>waits for a seller</small></div>
+    </div>
+    <div class="flane">
+      <span class="ftag out">SELLER</span>
+      <div class="fnode">sell(shares, floor)</div><span class="far">&rarr;</span>
+      <div class="fnode hot">sweep cheapest-first<small>read NAV, match on-chain</small></div><span class="far">&rarr;</span>
+      <div class="fnode">USDC now, at a discount<small>unsold falls to the queue at NAV</small></div>
+    </div>
+    <div class="flane">
+      <span class="ftag gen">BUYER GETS</span>
+      <div class="fnode">BidVault + LP token<small>one ERC-4626 per fill</small></div><span class="far">&rarr;</span>
+      <div class="fnode hot">auto requestRedeem<small>through the existing Vault queue</small></div><span class="far">&rarr;</span>
+      <div class="fnode">redeem LP at NAV<small>profit = the discount</small></div>
+    </div>
+  </div>
+  <p style="color:var(--dim);font-size:12.5px;margin-top:2px">The discount is a fixed ladder, not a free value: that keeps liquidity concentrated at a few price points so a seller fills fast, while staying variant 1a (one vault and one LP token per bid). Pooling buyers into a shared vault would be variant 2, a different design.</p>
+
+  <h3 style="font-size:17px;margin:22px 0 4px">What was added (core contracts untouched)</h3>
+  <table>
+    <tr><th>Contract</th><th>Role</th></tr>
+    <tr><td><code>OTCMarket</code></td><td>The bid book and the on-chain cheapest-first matcher; escrows USDC, settles each fill, refunds on wind-down.</td></tr>
+    <tr><td><code>OTCFactory</code></td><td>Deploys one <code>BidVault</code> per fill.</td></tr>
+    <tr><td><code>BidVault</code></td><td>Per-bid ERC-4626-style vault: holds the bought shares, mints an LP token to the buyer, auto-redeems through the Vault, and recovers value on wind-down.</td></tr>
+    <tr><td><code>Vault</code> / <code>Custody</code></td><td><b>Unchanged.</b> OTC only moves ownership of existing shares; it never mints or burns, so NAV and supply are untouched and there is no double-counting.</td></tr>
+  </table>
+
+  <h3 style="font-size:17px;margin:22px 0 4px">The evidence</h3>
+  <p style="color:var(--muted);font-size:14px">Six acceptance scenarios plus a fuzz invariant, all green (27 OTC tests, 64 across the whole repo), with exact-number assertions.</p>
+  <div class="cards">
+    <div class="card"><span class="pass">PASS</span><div class="sid">OTC-1</div>
+      <h3>Full fill</h3>
+      <div class="pv">Seller exits instantly at a 5% discount; buyer redeems at NAV.</div>
+      <div class="nums">Sell 10,000 shares, seller gets 9,500 USDC now. Buyer redeems for 10,000 USDC. Profit = 500 = the discount.</div>
+    </div>
+    <div class="card"><span class="pass">PASS</span><div class="sid">OTC-2</div>
+      <h3>Partial fill, queue fallback</h3>
+      <div class="pv">Only part of the lot finds buyers; the rest redeems normally.</div>
+      <div class="nums">Demand for 5,000 of 8,000: 5,000 sold on OTC, 3,000 returned and redeemed at NAV via the queue.</div>
+    </div>
+    <div class="card"><span class="pass">PASS</span><div class="sid">OTC-3</div>
+      <h3>Two bids, cheapest-first</h3>
+      <div class="pv">Distinct BidVaults, non-fungible LP, 5% filled before 10%.</div>
+      <div class="nums">5% bid filled in full (5,000), then 3,000 from the 10% bid; two separate vaults and LP tokens.</div>
+    </div>
+    <div class="card"><span class="pass">PASS</span><div class="sid">OTC-4</div>
+      <h3>Cancel a resting bid</h3>
+      <div class="pv">A buyer withdraws an unmatched bid.</div>
+      <div class="nums">Full USDC refunded; the bid leaves the book.</div>
+    </div>
+    <div class="card"><span class="pass">PASS</span><div class="sid">OTC-5</div>
+      <h3>Wind-down recovery</h3>
+      <div class="pv">Open bids refunded; an in-flight BidVault still recovers full NAV.</div>
+      <div class="nums">Even if wind-down hits before the auto-redeem settles, the buyer recovers 10,000 USDC, never stranded.</div>
+    </div>
+    <div class="card"><span class="pass">PASS</span><div class="sid">OTC-6</div>
+      <h3>Reverts</h3>
+      <div class="pv">Bad inputs and wrong state are rejected.</div>
+      <div class="nums">Off-ladder discount, no bid under the floor, and any OTC action outside EpochBased all revert.</div>
+    </div>
+    <div class="card"><span class="pass">PASS</span><div class="sid">INV</div>
+      <h3>Escrow fully backed</h3>
+      <div class="pv">The market can always refund every resting bid.</div>
+      <div class="nums">128,000 fuzz calls, 0 violations: USDC held is never less than the sum of resting bids.</div>
+    </div>
+  </div>
+
+  <pre class="demo">Seller holds 10,000 rACCESS shares and wants out before the next epoch.
+
+  Buyer  placeBid(5% rung, 9,500 USDC)        bid rests, USDC escrowed
+  Seller sell(10,000 shares, floor 10%)       matched cheapest-first, on-chain
+         &rarr; seller receives 9,500 USDC now     fast exit at a 5% discount
+         &rarr; BidVault holds the claim, mints 10,000 LP to the buyer
+
+  Admin  processEpoch (NAV unchanged)
+  Buyer  claimRedemption + redeem(10,000 LP)
+         &rarr; buyer receives 10,000 USDC         full NAV
+         &rarr; buyer profit = 500 USDC            = the 5% discount the seller paid for speed</pre>
+
+  <div class="note"><b>Fund-safety, proven by adversarial review.</b> A whole-implementation review found one real bug: if wind-down was triggered before a buyer's auto-redeem settled, the buyer's LP could become unredeemable. It was fixed with <code>BidVault.claimWindDown</code>, which recovers the full NAV through the vault's pro-rata wind-down pool; a test now proves the buyer recovers 10,000 USDC in that exact case. Nobody is stranded.</div>
+
+  <div class="note"><b>Honest scope.</b> A proof-of-mechanism, not production: one ERC-4626 plus LP token per bid (gas not optimised), a fully on-chain matcher (an off-chain optimiser is an optional later phase), and no fee on the discount. The transferability and regulatory questions a real RWA secondary market raises are out of scope and listed in the design docs.</div>
 </div></section>
 
 <section id="next"><div class="wrap">

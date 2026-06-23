@@ -31,6 +31,42 @@ Together they prove every moving part of the mechanism:
 
 ---
 
+## Extension: OTC early-exit (variant 1a)
+
+A **Layer-0 early-exit market** built on top of the vault and proven on the same chain. A holder who
+wants out before the next epoch sells shares to another retail buyer at a small discount and gets
+USDC immediately; whatever does not sell falls through to the redemption queue at full NAV. The core
+`Vault`/`Custody` are **untouched** — OTC only moves ownership of existing shares (no mint/burn, no
+NAV double-count). Full design: [`docs/07-otc-early-exit-alt1-1a.md`](docs/07-otc-early-exit-alt1-1a.md);
+implementation plan: [`docs/superpowers/plans/2026-06-23-otc-early-exit.md`](docs/superpowers/plans/2026-06-23-otc-early-exit.md).
+
+**Mechanism:** buyers post resting bids (USDC escrowed) on a fixed discount ladder (1% / 2.5% / 5% /
+10%); a seller's single `sell()` transaction reads NAV and sweeps them **cheapest-first on-chain** (no
+keeper), settling atomically. Each fill spins up a per-bid `BidVault` (ERC-4626 + LP token) that
+auto-redeems through the existing queue; the buyer redeems LP for the NAV USDC, earning the discount.
+
+| # | Scenario | What it proves |
+|---|----------|----------------|
+| **OTC-1** | Full fill | Sell 10,000 shares at 5% → seller gets 9,500 USDC now; buyer redeems for 10,000; profit = 500 = the discount |
+| **OTC-2** | Partial fill, queue fallback | Unsold shares return to the seller and redeem at NAV via the queue |
+| **OTC-3** | Two bids, cheapest-first | Distinct BidVaults, non-fungible LP; the 5% bid fills before the 10% |
+| **OTC-4** | Cancel a resting bid | Buyer withdraws an unmatched bid; USDC fully refunded |
+| **OTC-5** | Wind-down recovery | Open bids refunded; an in-flight BidVault still recovers full NAV (never stranded) |
+| **OTC-6** | Reverts | Off-ladder discount, no bid under floor, or any action outside `EpochBased` revert |
+| **INV** | Escrow fully backed | 128,000 fuzz calls, 0 violations: the market can always refund every resting bid |
+
+```bash
+forge test --match-path 'test/otc/*'                          # 27 OTC tests
+forge script script/DemoOTC.s.sol --sig 'run(string)' "OTC1"  # narrated OTC walkthrough
+```
+
+> An adversarial whole-implementation review caught one real fund-safety bug (a BidVault stranded if
+> wind-down preceded its auto-redeem) and it was fixed (`BidVault.claimWindDown`) with a test proving
+> full-NAV recovery. POC simplifications (gas not optimised, no fee on the discount, transferability/
+> regulatory questions deferred) are documented in the design docs.
+
+---
+
 ## Demoing to stakeholders
 
 The fastest way to *show* the mechanism working. No deployment, no setup beyond installing Foundry —
@@ -96,16 +132,17 @@ The `ALL` run finishes with:
 
 ## Running the tests
 
-The automated test suite is the rigorous proof behind the demo (36 tests, exact-number assertions):
+The automated test suite is the rigorous proof behind the demo (64 tests, exact-number assertions):
 
 ```bash
 forge test                                  # full suite
-forge test --match-path 'test/scenarios/*'  # just the 8 acceptance scenarios
+forge test --match-path 'test/scenarios/*'  # the 8 core acceptance scenarios
+forge test --match-path 'test/otc/*'        # the OTC early-exit extension (27 tests)
 forge test --match-contract S4 -vvv         # one scenario, with traces
 forge test --match-contract InvariantTest   # value-conservation fuzz (200 runs)
 ```
 
-Expected: `36 passed; 0 failed`.
+Expected: `64 passed; 0 failed`.
 
 ---
 
@@ -153,9 +190,10 @@ Two production contracts (ADR 001) — **Vault holds state; Custody holds tokens
 | `src/Custody.sol` | Token holder + fund/AMM interactions; `onlyVault`-gated |
 | `src/interfaces/` | `IVault`, `ICustody` |
 | `src/mocks/` | `MockUSDC`, `MockPruv`, `MockLiquidBuffer`, `MockAMM` |
-| `test/` | Unit tests (`Vault.t.sol`, `Custody.t.sol`, `Mocks.t.sol`), `Invariant.t.sol`, and `scenarios/S1..S8` |
-| `script/Demo.s.sol` | The parameterised, manager-facing demo |
-| `docs/` | Requirements, architecture (ADR + diagrams), tech stack, spec, estimation |
+| `src/otc/` | `OTCMarket`, `OTCFactory`, `BidVault` — the OTC early-exit extension (variant 1a) |
+| `test/` | Unit tests (`Vault.t.sol`, `Custody.t.sol`, `Mocks.t.sol`), `Invariant.t.sol`, `scenarios/S1..S8`, and `otc/` (OTC-1..6 + invariant) |
+| `script/` | `Demo.s.sol` (8-scenario demo) and `DemoOTC.s.sol` (OTC walkthrough) |
+| `docs/` | Requirements, architecture (ADR + diagrams), tech stack, spec, estimation, and the OTC design + plan |
 
 **State machine** (transitions are one-way):
 
@@ -176,6 +214,10 @@ Details and the rationale are in [`CLAUDE.md`](CLAUDE.md).
 
 **In:** 5-state lifecycle · async queues · ERC-7887 cancel · P2P matching (both cases) · 3-layer
 redemption · rebalance-toward-target asset mix · manual NAV · full wind-down · 8 scenarios.
+
+**Extension (built on top):** OTC early-exit (variant 1a) · buyer-first resting bids on a fixed
+discount ladder · on-chain cheapest-first matching · per-bid `BidVault` + LP · auto-redeem · wind-down
+recovery · 6 scenarios + invariant. Core vault unchanged.
 
 **Out (deferred, re-estimate before pulling in):** UI · cross-chain bridge · Aave reinvest · real
 Curve formula · real Pruv API · role-based access · NAV oracle · full ERC-4626 · gas optimisation ·
