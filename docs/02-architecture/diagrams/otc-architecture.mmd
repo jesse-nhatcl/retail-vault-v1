@@ -17,15 +17,15 @@ graph TB
 
   BUYER -->|"1 placeBid: USDC escrowed (ladder rung)"| MKT
   SELLER -->|"2 sell(shares, floor)"| MKT
-  MKT -->|"3 pay USDC now, at a discount to NAV"| SELLER
-  MKT -->|"3 deploy"| FAC
-  FAC --> BV
-  MKT -->|"3 transfer filled shares"| BV
-  BV -->|"3 LP token (1:1)"| BUYER
-  BV -->|"4 requestRedeem then claim"| VAULT
-  MKT -.->|"read NAV"| VAULT
+  MKT -.->|"3 read NAV"| VAULT
+  MKT -->|"4 pay USDC now, at a discount to NAV"| SELLER
+  MKT -->|"5 deploy"| FAC
+  FAC -->|"creates"| BV
+  MKT -->|"6 move filled shares"| BV
+  BV -->|"7 mint LP token (1:1)"| BUYER
+  BV -->|"8 requestRedeem, then claim at NAV"| VAULT
+  ADMIN -->|"9 processEpoch"| VAULT
   MKT -.->|"unsold shares fall to queue"| VAULT
-  ADMIN -->|"processEpoch"| VAULT
   VAULT -->|"onlyVault"| CUST
 
   classDef ext fill:#0f2417,stroke:#1f5132,color:#e6edf3;
