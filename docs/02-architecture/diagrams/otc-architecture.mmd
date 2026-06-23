@@ -1,0 +1,36 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+graph TB
+  subgraph EXT["External World (single Anvil chain)"]
+    SELLER["Seller<br/>holds rACCESS shares<br/>wants out now"]
+    BUYER["Buyers<br/>bring USDC<br/>want yield"]
+    ADMIN["Admin EOA<br/>processEpoch, setPrice"]
+  end
+  subgraph OTCL["OTC Layer 0 (NEW)"]
+    MKT["OTCMarket<br/>bid book, cheapest-first match,<br/>USDC escrow, settle, wind-down refund"]
+    FAC["OTCFactory<br/>one BidVault per fill"]
+    BV["BidVault (per fill)<br/>ERC-4626 LP token<br/>auto-redeem + claimWindDown"]
+  end
+  subgraph CORE["Retail Vault (UNCHANGED)"]
+    VAULT["Vault.sol<br/>shares, queues, processEpoch, NAV"]
+    CUST["Custody.sol<br/>wRWA + liquid + idle USDC"]
+  end
+
+  BUYER -->|"1 placeBid: USDC escrowed (ladder rung)"| MKT
+  SELLER -->|"2 sell(shares, floor)"| MKT
+  MKT -->|"3 pay USDC now, at a discount to NAV"| SELLER
+  MKT -->|"3 deploy"| FAC
+  FAC --> BV
+  MKT -->|"3 transfer filled shares"| BV
+  BV -->|"3 LP token (1:1)"| BUYER
+  BV -->|"4 requestRedeem then claim"| VAULT
+  MKT -.->|"read NAV"| VAULT
+  MKT -.->|"unsold shares fall to queue"| VAULT
+  ADMIN -->|"processEpoch"| VAULT
+  VAULT -->|"onlyVault"| CUST
+
+  classDef ext fill:#0f2417,stroke:#1f5132,color:#e6edf3;
+  classDef otc fill:#2a2410,stroke:#5c4a1a,color:#e6edf3;
+  classDef core fill:#0d2236,stroke:#1f4c73,color:#e6edf3;
+  class SELLER,BUYER,ADMIN ext;
+  class MKT,FAC,BV otc;
+  class VAULT,CUST core;
