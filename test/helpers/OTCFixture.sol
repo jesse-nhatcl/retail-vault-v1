@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Fixture} from "../helpers/Fixture.sol";
 import {OTCMarket} from "../../src/otc/OTCMarket.sol";
+import {OTCFactory} from "../../src/otc/OTCFactory.sol";
 
 /// @notice Reaches EpochBased with `alice` holding shares, then deploys an OTCMarket
 ///         with a {1%,2.5%,5%,10%} discount ladder.
@@ -21,7 +22,8 @@ abstract contract OTCFixture is Fixture {
         LADDER.push(250);
         LADDER.push(500);
         LADDER.push(1000);
-        otc = new OTCMarket(address(vault), usdc, LADDER);
+        OTCFactory factory = new OTCFactory();
+        otc = new OTCMarket(address(vault), usdc, LADDER, factory);
     }
 
     /// @notice Helper: approve and place a bid from `who`.

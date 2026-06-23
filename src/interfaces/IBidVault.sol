@@ -2,7 +2,6 @@
 pragma solidity 0.8.24;
 
 interface IBidVault {
-    error NotMarket();
     error NothingToClaim();
     error AlreadyInitiated();
 

@@ -14,7 +14,6 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 contract BidVault is IBidVault, ERC20, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    address public immutable market;
     IVault public immutable vault;
     IERC20 public immutable usdc;
     address public immutable buyer;
@@ -23,7 +22,6 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
     bool public redeemInitiated;
 
     constructor(address vault_, MockUSDC usdc_, address buyer_, uint256 shares_) ERC20("OTC BidVault LP", "otcLP") {
-        market = msg.sender;
         vault = IVault(vault_);
         usdc = IERC20(address(usdc_));
         buyer = buyer_;
@@ -31,9 +29,8 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
         _mint(buyer_, shares_); // LP 1:1 with shares held
     }
 
-    /// @notice Queue the held shares for redemption through the Vault. Market-only, once.
+    /// @notice Queue the held shares for redemption through the Vault. Permissionless, once.
     function initRedeem() external {
-        if (msg.sender != market) revert NotMarket();
         if (redeemInitiated) revert AlreadyInitiated();
         redeemInitiated = true;
         redeemRequestId = vault.requestRedeem(shares);

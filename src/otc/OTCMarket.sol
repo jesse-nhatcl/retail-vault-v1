@@ -8,6 +8,8 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IOTCMarket} from "../interfaces/IOTCMarket.sol";
 import {IVault} from "../interfaces/IVault.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
+import {OTCFactory} from "./OTCFactory.sol";
+import {BidVault} from "./BidVault.sol";
 
 /// @notice See docs/07-otc-early-exit-alt1-1a-breakdown.md. Phase 0: swaps shares straight to buyers.
 contract OTCMarket is IOTCMarket, ReentrancyGuard {
@@ -21,6 +23,9 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
     IVault public immutable vault; // also the rACCESS ERC20
     IERC20 public immutable shareToken;
     IERC20 public immutable usdc;
+    OTCFactory public immutable factory;
+
+    mapping(uint256 => address) public bidVaultOf; // bidId -> last BidVault created for it
 
     uint16[] internal _ladder;
     mapping(uint16 => bool) public onLadder;
@@ -28,11 +33,12 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
     Bid[] public bids; // bidId = index
     mapping(uint16 => uint256[]) internal _book; // discountBps -> FIFO bidIds
 
-    constructor(address vault_, MockUSDC usdc_, uint16[] memory ladder_) {
+    constructor(address vault_, MockUSDC usdc_, uint16[] memory ladder_, OTCFactory factory_) {
         if (ladder_.length == 0) revert InvalidLadder();
         vault = IVault(vault_);
         shareToken = IERC20(vault_);
         usdc = IERC20(address(usdc_));
+        factory = factory_;
         for (uint256 i = 0; i < ladder_.length; i++) {
             if (ladder_[i] >= BPS) revert InvalidLadder();
             if (i > 0 && ladder_[i] <= ladder_[i - 1]) revert InvalidLadder();
@@ -138,7 +144,10 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
                 remaining -= fill;
                 usdcToSeller += usdcPaid;
 
-                shareToken.safeTransfer(b.buyer, fill);
+                address bv = factory.createBidVault(address(vault), MockUSDC(address(usdc)), b.buyer, fill);
+                shareToken.safeTransfer(bv, fill);
+                BidVault(bv).initRedeem();
+                bidVaultOf[q[i]] = bv;
                 emit BidFilled(q[i], b.buyer, fill, usdcPaid);
             }
             if (capped) break;

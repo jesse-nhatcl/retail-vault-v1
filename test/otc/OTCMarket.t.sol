@@ -4,6 +4,8 @@ pragma solidity 0.8.24;
 import {OTCFixture} from "../helpers/OTCFixture.sol";
 import {IOTCMarket} from "../../src/interfaces/IOTCMarket.sol";
 import {OTCMarket} from "../../src/otc/OTCMarket.sol";
+import {OTCFactory} from "../../src/otc/OTCFactory.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract OTCMarketTest is OTCFixture {
     function setUp() public {
@@ -71,7 +73,10 @@ contract OTCMarketTest is OTCFixture {
 
         assertEq(sold, 10_000e18);
         assertEq(usdc.balanceOf(alice), aliceUsdcBefore + 9500e6);
-        assertEq(vault.balanceOf(bob), 10_000e18); // Phase 0: buyer receives shares directly
+        address bv = otc.bidVaultOf(id);
+        assertTrue(bv != address(0));
+        assertEq(vault.balanceOf(bob), 0);
+        assertEq(IERC20(address(bv)).balanceOf(bob), 10_000e18); // LP minted 1:1
         assertEq(usdc.balanceOf(address(otc)), 0);
         (,, uint256 rem, IOTCMarket.BidStatus status) = otc.bids(id);
         assertEq(rem, 0);
@@ -79,13 +84,13 @@ contract OTCMarketTest is OTCFixture {
     }
 
     function test_Sell_CheapestFirst() public {
-        _placeBid(charlie, 1000, 9000e6); // 10% bid -> should fill LAST
-        _placeBid(bob, 500, 4750e6); // 5% bid -> 5,000 shares, fills FIRST
+        uint256 idC = _placeBid(charlie, 1000, 9000e6); // 10% bid -> should fill LAST
+        uint256 idB = _placeBid(bob, 500, 4750e6); // 5% bid -> 5,000 shares, fills FIRST
 
         _sell(alice, 5000e18, 1000);
 
-        assertEq(vault.balanceOf(bob), 5000e18);
-        assertEq(vault.balanceOf(charlie), 0);
+        assertEq(IERC20(address(otc.bidVaultOf(idB))).balanceOf(bob), 5000e18); // bob's bid filled first
+        assertEq(otc.bidVaultOf(idC), address(0)); // charlie's bid untouched
     }
 
     function test_Sell_PartialReturnsUnsold() public {
@@ -111,8 +116,18 @@ contract OTCMarketTest is OTCFixture {
         uint16[] memory bad = new uint16[](2);
         bad[0] = 500;
         bad[1] = 100; // not ascending
+        OTCFactory factory = new OTCFactory();
         vm.expectRevert(); // InvalidLadder
-        new OTCMarket(address(vault), usdc, bad);
+        new OTCMarket(address(vault), usdc, bad, factory);
+    }
+
+    function test_Sell_DeploysBidVaultAndMintsLp() public {
+        uint256 id = _placeBid(bob, 500, 9500e6);
+        _sell(alice, 10_000e18, 1000);
+        address bv = otc.bidVaultOf(id);
+        assertTrue(bv != address(0));
+        assertEq(vault.balanceOf(bob), 0);
+        assertEq(IERC20(address(bv)).balanceOf(bob), 10_000e18);
     }
 
     function test_CloseForWindDown_RefundsOpenBids() public {
