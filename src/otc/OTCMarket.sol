@@ -69,9 +69,19 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         emit BidPlaced(bidId, msg.sender, discountBps, usdcIn);
     }
 
-    /// @notice Cancel a resting bid and reclaim escrowed USDC. Not yet implemented.
-    function cancelBid(uint256) external {
-        revert BidNotResting(); // implemented in a later task
+    /// @notice Cancel a resting bid and reclaim escrowed USDC.
+    /// @param bidId The ID of the bid to cancel.
+    function cancelBid(uint256 bidId) external nonReentrant {
+        Bid storage b = bids[bidId];
+        if (b.buyer != msg.sender) revert NotBidOwner();
+        if (b.status != BidStatus.Resting) revert BidNotResting();
+
+        uint256 refund = b.usdcRemaining;
+        b.usdcRemaining = 0;
+        b.status = BidStatus.Cancelled;
+        usdc.safeTransfer(msg.sender, refund);
+
+        emit BidCancelled(bidId, refund);
     }
 
     /// @notice Sell shares into resting bids, cheapest discount first. Not yet implemented.

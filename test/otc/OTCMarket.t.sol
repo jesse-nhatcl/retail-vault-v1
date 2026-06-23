@@ -41,4 +41,24 @@ contract OTCMarketTest is OTCFixture {
         otc.placeBid(300, 1000e6);
         vm.stopPrank();
     }
+
+    function test_CancelBidRefunds() public {
+        uint256 id = _placeBid(bob, 500, 1000e6);
+        uint256 balBefore = usdc.balanceOf(bob);
+
+        vm.prank(bob);
+        otc.cancelBid(id);
+
+        assertEq(usdc.balanceOf(bob), balBefore + 1000e6);
+        (,, uint256 rem, IOTCMarket.BidStatus status) = otc.bids(id);
+        assertEq(rem, 0);
+        assertEq(uint8(status), uint8(IOTCMarket.BidStatus.Cancelled));
+    }
+
+    function test_Revert_CancelBidNotOwner() public {
+        uint256 id = _placeBid(bob, 500, 1000e6);
+        vm.prank(charlie);
+        vm.expectRevert(IOTCMarket.NotBidOwner.selector);
+        otc.cancelBid(id);
+    }
 }
