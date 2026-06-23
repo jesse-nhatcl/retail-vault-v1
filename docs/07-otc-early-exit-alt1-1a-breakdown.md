@@ -17,7 +17,7 @@
 
 **Non-goals (explicitly deferred):**
 - Pooled tiers (variant 2) or FIFO orderbook (variant 3).
-- Real off-chain ROuter infra — modelled as a thin, **untrusted trigger** with on-chain validation.
+- Off-chain ROuter infra — matching runs **on-chain inside the seller's tx**; an off-chain ROuter/keeper is an optional Phase 2 (compute off-chain, then settle on-chain-validated).
 - Fees (0% per POC), Alt-2 / Balancer path, production hardening, gas optimisation.
 
 ---
@@ -64,7 +64,7 @@ New code under `src/otc/`. Four units:
 
 | Contract | Responsibility | Notes |
 |---|---|---|
-| `OTCMarket` | Single registry/coordinator. Holds listings, escrows seller shares + buyer USDC pre-settlement, validates and triggers settlement. Gated to `Vault` state. | One instance; `Ownable` for config; `nonReentrant` on value-moving calls. |
+| `OTCMarket` | Single registry/coordinator. Holds the resting **bid book** + escrowed buyer USDC; the seller's `sell()` reads NAV, matches cheapest-first, and settles atomically on-chain. Gated to `Vault` state. | One instance; `Ownable` for config (ladder); `nonReentrant` on value-moving calls. |
 | `OTCFactory` | Deploys one `BidVault` per accepted bid. | Could be folded into `OTCMarket`; kept separate to mirror the sketch's "vault per buyer". |
 | `BidVault` | ERC-4626-style escrow for one bid: holds bought shares, issues LP token, drives `requestRedeem`/`claim`, distributes USDC pro-rata to LP holders. | Minimal; the "gives out vault token" part of 1a. |
 | Interfaces | `IOTCMarket`, `IBidVault`. | Signatures locked here before implementation. |
@@ -74,32 +74,27 @@ Reused as-is: `Vault` (shares + redeem queue), `Custody`, `MockUSDC`, `INavSourc
 ### 4.1 Data model (sketch)
 
 ```solidity
-struct Listing {
-    address seller;
-    uint256 shares;          // 18-dec, escrowed in OTCMarket
-    uint16  maxDiscountBps;  // seller floor, e.g. 1000 = 10%
-    uint256 filled;          // shares already settled
-    Status  status;          // Open | Settled | Cancelled
-}
-
+// Buy side: resting bids, grouped by ladder rung (the on-chain bid book).
 struct Bid {
     address buyer;
-    uint256 listingId;
-    uint16  discountBps;     // must be <= listing.maxDiscountBps
+    uint16  discountBps;     // must be on the fixed ladder (D8)
     uint256 usdcIn;          // 6-dec, escrowed in OTCMarket
-    address bidVault;        // 0 until settled
-    Status  status;
+    address bidVault;        // 0 until matched
+    Status  status;          // Resting | Matched | Cancelled
 }
+mapping(uint16 => Bid[]) bidBook;   // rung (discountBps) -> FIFO queue of bids
+
+// Sell side has no resting struct: the seller's `sell()` escrows shares and matches
+// the bid book in the same tx. A resting sell-listing is deferred (not needed for the core).
 ```
 
 ### 4.2 Function surface (sketch, not final)
 
 `OTCMarket`
-- `list(uint256 shares, uint16 maxDiscountBps) → listingId` — seller escrows shares (`SafeERC20` pull).
-- `placeBid(uint256 listingId, uint16 discountBps, uint256 usdcIn) → bidId` — buyer escrows USDC; reverts if `discountBps > maxDiscountBps`.
-- `settle(uint256 bidId)` — validate against on-chain NAV; deploy BidVault via factory; pay seller; fund BidVault with shares; mint LP to buyer. Permissionless trigger (anyone can call; ROuter is just a convenience caller).
-- `cancelBid(bidId)` / `cancelListing(listingId)` — refund escrow before settlement.
-- `closeForWindDown()` — admin/`Vault`-driven; refund all open escrow when the vault winds down.
+- `placeBid(uint16 discountBps, uint256 usdcIn) → bidId` — buyer escrows USDC up front into the bid book; reverts if `discountBps` is off-ladder. Bids rest until a seller fills (buyer-first, D9).
+- `sell(uint256 shares, uint16 maxDiscountBps) → filled` — **the matching entry point, fully on-chain (D5, §9).** Seller escrows shares, reads NAV on-chain, sweeps resting bids cheapest-first up to the floor (cap N bids/tx); each match atomically pays the seller, deploys a BidVault with the shares, and mints LP to the buyer. Unsold shares return to the seller.
+- `cancelBid(bidId)` — buyer withdraws a resting bid; USDC refunded.
+- `closeForWindDown()` — admin/`Vault`-driven; refund all open bids when the vault winds down.
 
 `BidVault` (per bid)
 - `constructor(vault, usdc, shares, buyer)` — receives shares, mints LP to buyer, calls `Vault.requestRedeem(shares)`.
@@ -119,23 +114,22 @@ sequenceDiagram
     participant BV as BidVault
     participant V as Vault (existing)
 
-    S->>M: list(M shares, maxDiscount)
-    Note over M: shares escrowed
-    B->>M: placeBid(listingId, d, USDC_in)
-    Note over M: USDC escrowed, d <= maxDiscount
-    M->>M: settle(bidId) — read NAV via INavSource
-    M->>S: pay USDC_in (discounted exit)
+    B->>M: placeBid(d, USDC_in)
+    Note over M: USDC escrowed, d on ladder; bid rests
+    S->>M: sell(M shares, floor) — read NAV, sweep bids cheapest-first
+    Note over M: per matched bid, atomically:
+    M->>S: pay USDC (discounted exit)
     M->>F: deploy BidVault
     F-->>BV: new vault
-    M->>BV: transfer M_bid shares
+    M->>BV: transfer matched shares
     BV->>B: mint LP tokens
-    BV->>V: requestRedeem(M_bid)
+    BV->>V: requestRedeem(matched)
     Note over V: next epoch settles at NAV
     BV->>V: claim(requestId) → USDC
     B->>BV: redeem(LP) → NAV USDC
 ```
 
-Unfilled tail: after all bids settle, `OTCMarket` returns `listing.shares - listing.filled` to the seller.
+Unfilled tail: `sell()` returns the unmatched shares to the seller, who can route them to the redemption queue.
 
 ---
 
@@ -152,15 +146,17 @@ Unfilled tail: after all bids settle, `OTCMarket` returns `listing.shares - list
 
 ---
 
-## 7. Decisions to lock before coding
+## 7. Decisions (locked)
 
-- **D1 — Escrow location.** Shares + USDC sit in `OTCMarket` until settle (chosen), vs straight into BidVault. Market-escrow keeps cancel/refund simple.
-- **D2 — Auto-queue vs hold.** Does `BidVault` auto-`requestRedeem` (chosen, matches sketch), or can the buyer choose to *hold* the shares as a vault investor instead of redeeming?
-- **D3 — NAV accounting.** Shares in OTC are still outstanding → still backed, no double-count. Confirm nothing re-prices them twice.
-- **D4 — Pricing time.** NAV read at `settle` (chosen) — fixes the arb window. Document that a stale NAV between bid and settle is the seller/buyer's risk.
-- **D5 — ROuter trust.** `settle` is permissionless and fully validated on-chain (discount ≤ floor, USDC sufficient, NAV read on-chain). ROuter only *triggers*; it cannot misprice or steal. (Alternative: EIP-712 signed bids — deferred.)
-- **D6 — Cancel semantics.** Bids/listings cancellable before settle; mirror `cancelRequest` ergonomics. On `WindDown`, force-refund all open escrow.
-- **D7 — Fees.** 0% for the POC. Leave a single hook point if a cut is ever added.
+- **D1 — Escrow location.** Shares + USDC sit in `OTCMarket` until settle. Market-escrow keeps cancel/refund simple.
+- **D2 — Auto-queue.** `BidVault` auto-`requestRedeem`s its shares so the buyer gets USDC at the next epoch. (Hold-as-investor is a later option.)
+- **D3 — NAV accounting.** OTC only moves share ownership; shares stay in `totalSupply` → backed, **no double-count**.
+- **D4 — Pricing time.** NAV is read **at `settle`**, on-chain. A stale NAV between bid and settle is the parties' risk.
+- **D5 — On-chain matching, no keeper.** Matching runs **inside the seller's `sell()` tx**: read NAV on-chain, sweep the bid book cheapest-first (≤ floor, cap N/tx), settle atomically. No off-chain matcher in the core path; consistent with `processEpoch`. A keeper / off-chain optimizer (compute then `settle` on-chain-validated) is an **optional Phase 2**. (EIP-712 signed bids deferred.)
+- **D6 — Cancel semantics.** Resting bids cancellable any time before they match. On `WindDown`, force-refund all open bids; settled BidVaults flow on at NAV. OTC opens **only in `EpochBased`**.
+- **D7 — Fees.** 0% for the POC. One hook point left for a future cut.
+- **D8 — Discount ladder (not free).** Buyers pick a discount from a **small fixed ladder** (e.g. {1% / 2.5% / 5% / 10%}, governance-set), not a continuous value. Concentrates liquidity at Schelling points while staying 1a (own vault + own LP per bid, no pooling — pooling would be variant 2). See `07-otc-early-exit-alt1-1a.md` §6.
+- **D9 — Buyer-first, resting bids.** Buyers post bids with **USDC escrowed up front** and rest until a seller arrives; the seller is the taker and fills **cheapest-first** up to their floor. Seller-first would defeat the "fast exit" goal.
 
 ---
 
@@ -178,9 +174,10 @@ Unfilled tail: after all bids settle, `OTCMarket` returns `listing.shares - list
 | OTC-1 | Single full fill | seller paid discounted USDC; buyer LP = bought shares; after epoch buyer redeems NAV USDC; profit = discount |
 | OTC-2 | Partial fill → queue fallback | unsold shares returned to seller; seller can `requestRedeem` the remainder normally |
 | OTC-3 | Two bids, different discounts (5% / 10%) | two BidVaults deployed; each buyer settled at their own price; LP tokens non-fungible |
-| OTC-4 | Cancel bid / listing before settle | full escrow refund; no BidVault deployed |
-| OTC-5 | WindDown mid-listing | `closeForWindDown` refunds all open escrow; settled BidVaults still claimable |
-| OTC-6 | Reverts | bid discount > floor; settle below floor price; OTC action outside `EpochBased` |
+| OTC-4 | Cancel a resting bid | full USDC refund; bid removed from the book |
+| OTC-5 | WindDown with open bids | `closeForWindDown` refunds all resting bids; settled BidVaults still claimable |
+| OTC-3b | Cheapest-first ordering | seller's `sell()` fills the 5% bids before the 10% bids; stops at the floor |
+| OTC-6 | Reverts | bid discount off-ladder; `sell()` finds no bid ≤ floor; OTC action outside `EpochBased` |
 
 **Invariants (candidates for `invariant_`):**
 - OTC never changes `Vault.totalSupply` except through the existing redeem burn.
@@ -193,9 +190,9 @@ TDD per `.claude/rules/testing.md`: write the failing scenario first, watch it f
 
 ## 9. Phasing
 
-- **Phase 0 — P2P discounted swap (cheapest early-exit).** `OTCMarket` only: seller lists, buyer bids, `settle` does an atomic shares↔USDC swap at the discounted price. No BidVault, no LP token. This already delivers early-exit and is the low-cost core.
+- **Phase 0 — P2P discounted swap (cheapest early-exit).** `OTCMarket` only: buyers `placeBid` (resting), seller `sell()` does the on-chain cheapest-first sweep + atomic shares↔USDC swap at the discounted price. No BidVault, no LP token. This already delivers early-exit and is the low-cost core.
 - **Phase 1 — variant 1a wrapper.** Add `OTCFactory` + `BidVault` + LP token + auto-`requestRedeem`/`claim`. This is the "vault per buyer" part — and the expensive part (one ERC-4626 + LP per bid), exactly the cost flagged in the concept doc.
-- **Phase 2 — ROuter / matching polish.** Off-chain matching, partial-fill splitting across multiple bids, optional EIP-712 signed orders.
+- **Phase 2 — off-chain matching (optional).** Off-chain optimizer/keeper (compute then settle on-chain-validated) to cut seller gas and improve multi-seller allocation, optional EIP-712 signed orders. The core path does not depend on it.
 
 > Phase 0 alone is a defensible MVP of early-exit. Phases 1–2 buy tradability and price discovery at rising complexity —
 > revisit against the pooled/FIFO variants before committing to the per-bid-vault cost.

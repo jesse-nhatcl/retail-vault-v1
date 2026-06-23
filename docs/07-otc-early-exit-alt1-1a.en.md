@@ -35,6 +35,10 @@ Design problem: build a **secondary market / OTC layer** that meets these requir
 | **Partial fill** | rarely are there enough buyers for the whole lot |
 | **Fallback** for the unsold portion | route to the **PRIMARY redemption queue** (slow channel) — nobody gets stuck |
 | Off-chain coordination, on-chain settlement | flexible matching; funds/claims held on-chain |
+| **Escrow both sides + atomic settlement** | seller shares and buyer USDC safely locked; the swap is atomic, neither party can default |
+| **Cancel/withdraw before a match** | seller pulls a listing, buyer pulls a resting bid → escrow refunded |
+| **NAV reference at settle** | the discount is "vs NAV" → needs a trusted price anchor at match time |
+| **One share, one place (no double-spend)** | a share in OTC is not simultaneously in the redeem queue |
 
 Core entities:
 
@@ -167,11 +171,167 @@ graph TD
 
 ---
 
-## 4. Open questions (before pulling into scope)
+## 4. Resolved decisions
 
-1. Is this OTC layer a **standalone product** or just an **early-exit path** of the retail vault?
-2. Do shares locked in OTC still count toward NAV / can they be redeemed in parallel? (avoid double-counting)
-3. Do we layer a **fee** on the discount, or leave 100% of the premium to the buyer? (ties into `docs/06-fees` — early-exit / instant-exit)
-4. What trust level does off-chain matching (ROuter) need — who runs it, and how is settlement done on-chain so ROuter need not be trusted?
-5. Relationship with `cancelRequest` and the state machine: in which state does OTC open (only `EpochBased`?), and does it close on `WindDown`?
-6. Is the cost of deploying one ERC-4626 vault + LP token **per bid** acceptable, or do we need to pool (see the other variants in the full edition)?
+| # | Question | Decision |
+|---|---|---|
+| 1 | Standalone or early-exit path? | **Early-exit path** of the retail vault (Layer 0). |
+| 2 | Can OTC-locked shares be redeemed / do they double-count NAV? | **Escrow via `transferFrom` at list time** → holder loses the redeem right. A share lives in exactly **one** place at a time (wallet / queue / OTC). It stays in `totalSupply` → **no double-count**. After settle, the **BidVault** owns the share, so *it* calls `requestRedeem`. |
+| 3 | Fee on the discount? | **Skip** (0% for the POC), leave one hook. |
+| 4 | On-chain matching or a keeper? | **On-chain by default** (see §9). Buyers post bids (USDC escrowed) that rest; **the seller's `sell()` tx sweeps bids cheapest-first and settles atomically on-chain** — no keeper, consistent with `processEpoch` matching. Cap bids scanned per tx for gas. A keeper/ROuter is only an **optional Phase 2** (off-chain allocation, then settle the result). |
+| 5 | Relationship with `cancelRequest` + which state? | Only list shares **free in the wallet** → OTC and the redeem queue are **mutually exclusive**, so `cancelRequest` is untouched. OTC **opens only in `EpochBased`**; `triggerWindDown` **refunds all open escrow**, while settled BidVaults flow on through wind-down at NAV. |
+| 6 | Gas of deploying vault+LP per bid? | **Accepted**, ignored. |
+
+---
+
+## 5. Matching dynamics & incentives
+
+**Both sides' incentive** — the discount is the *price of immediacy*:
+
+| | Seller (exiting) | Buyer |
+|---|---|---|
+| Wants | cash **now** | **Delta** (buy below NAV) |
+| On the discount | **pays** | **earns** |
+| Alternative | `requestRedeem` → wait ~1 epoch, get full NAV | hold USDC, do nothing |
+
+A trade clears when there is overlap: `value-of-immediacy(seller) > discount > cost-of-waiting(buyer)`. No overlap → no match → falls to the queue.
+
+**Who appears first? → Buyers first.** For a genuinely *fast* exit, buy-side liquidity must be **resting**; the seller arrives and **fills instantly**:
+
+```
+Resting bids on a ladder (USDC already escrowed). Each [b] = one buyer's bid-vault:
+   1%   [b][b]          ◄ cheapest for the seller  → fill FIRST
+   2.5% [b]
+   5%   [b][b][b]
+   10%  [b]             ◄ most expensive           → fill LAST
+
+Seller sells M shares (keeps a floor = max acceptable discount):
+   sweep cheapest-first: 1% → 2.5% → 5% ...   (only take levels ≤ floor)
+       ├─ enough buyers → USDC NOW @ NAV − discount        (fast exit)
+       └─ short / empty → remainder → REDEMPTION QUEUE @ NAV (slow, NO discount)
+```
+- **Buyer = price-maker** (sets the discount), **Seller = price-taker** (takes the cheapest bid first; only keeps a **floor**).
+- Seller-first would turn OTC into "another queue" → loses all the speed value.
+
+**No liquidity (cold-start):**
+- The unsold portion → **redemption queue, paid full NAV, NO discount**. → there is **no "discount death-spiral"**: the leftover loses only *speed* (waits one epoch), **not price**.
+- So **"a buyer is required for early-exit" is acceptable** — the fallback leaves nobody stuck and nobody worse off. (A protocol backstop pool quoting a fixed discount is a bigger feature → deferred.)
+
+---
+
+## 6. How the discount is set — keep 1a but NOT free
+
+If buyers set the discount **freely / continuously** → liquidity **fragments** (3.1% / 3.15% / 4.2%…), pools are thin, the seller struggles to fill fast. But pooling-per-tier is **variant 2**, not the assignment.
+
+Resolve it by separating **two independent axes**:
+- **Axis A — discount value:** free ⟷ **fixed ladder**.
+- **Axis B — vault grouping:** one-vault-per-buyer (**1a**) ⟷ shared pool per tier (**2**).
+
+```
+                          Axis B — vault grouping
+              one-vault-per-buyer (1a)    │    shared pool per tier (2)
+            ┌─────────────────────────────┼─────────────────────────────┐
+   free     │  1a free                    │  (rarely used)               │
+  Axis A    │  fragmented price           │                             │
+  (price)   ├─────────────────────────────┼─────────────────────────────┤
+  ladder    │  ★ 1a + ladder  ← CHOSEN     │  variant 2                   │
+            │  own LP, concentrated price  │  fungible LP, concentrated   │
+            └─────────────────────────────┴─────────────────────────────┘
+   Tighten axis A (free → ladder) but KEEP axis B = 1a  →  still 1a, not variant 2.
+```
+
+What *defines* variant 2 is **axis B = pooling** (shared vault + fungible LP), **not** "discrete prices". So we tighten **axis A** while keeping **axis B = 1a**:
+
+> **Decision: 1a + a small fixed discount ladder** (e.g. {1% / 2.5% / 5% / 10%}, set by governance at config). Each buyer **still gets their own vault + own LP**; the only change is the discount **must be chosen from the ladder**.
+
+Comparison (two buyers both pick 5%):
+
+| | Vault | LP token | Discount | What it is |
+|---|---|---|---|---|
+| 1a free | one vault per buyer | own, non-fungible | **any %** | fragmented price |
+| **1a + ladder (chosen)** | **one vault per buyer** | **own, non-fungible** | **from ladder** | **still 1a, disciplined price** |
+| variant 2 | **one vault per tier (shared)** | **fungible in tier** | from ladder | pooling |
+
+- ✅ The ladder **concentrates liquidity at a few price points** (Schelling points) → the seller sweeping cheapest-first hits real depth → fixes the free downside.
+- ✅ **Still genuinely 1a:** vault-per-buyer + own LP + buyer-created bid.
+- ⚠️ What 1a does **not** remove (and we accept): LP is **not fungible** across buyers + **many vaults**. Removing those → must pool → becomes variant 2.
+
+---
+
+## 7. Locked design (summary)
+
+**Early-exit Layer 0 along variant 1a, with price discipline:**
+
+1. Goal: early-exit path of the retail vault; unsold remainder → redemption queue at NAV.
+2. **Buyer-first:** buyers post bids, **USDC escrowed immediately**, resting. Each bid = 1 ERC-4626 vault + 1 own LP token.
+3. **Discount from a fixed ladder** (config), not free — concentrates liquidity yet stays 1a.
+4. **Seller** lists shares **free in the wallet** (escrowed at list) → fills **cheapest-first**; keeps only a **floor**.
+5. **NAV read on-chain at settle**; no double-count (shares stay in `totalSupply`).
+6. **On-chain matching:** the seller's `sell()` tx sweeps bids cheapest-first and settles atomically (cap bids/tx). No keeper; off-chain matching is an optional Phase 2.
+7. **State:** open in `EpochBased`; `WindDown` refunds open escrow, settled BidVaults flow on at NAV.
+8. Fee 0%, gas ignored (POC).
+
+---
+
+## 8. Implementation direction 
+
+**Reuse the whole existing vault; add 3 contracts for the OTC Layer 0.**
+
+```mermaid
+graph LR
+    Seller([Seller])
+    Buyer([Buyer])
+    subgraph NEW["OTC Layer 0 — NEW"]
+        M[OTCMarket<br/>escrow + settle + ladder]
+        F[OTCFactory]
+        BV[BidVault / bid<br/>ERC-4626 + LP token]
+    end
+    subgraph CORE["Retail Vault — EXISTS"]
+        V[Vault<br/>shares · queues · processEpoch]
+        C[Custody<br/>wRWA + liquid + USDC]
+    end
+    Buyer -->|"1 bid + USDC (ladder)"| M
+    Seller -->|"2 list shares"| M
+    M -->|"3 deploy"| F --> BV
+    M -->|"3 pay USDC now"| Seller
+    BV -->|"3 LP token"| Buyer
+    BV -->|"4 requestRedeem / claim"| V
+    M -. read NAV .-> V
+    V --- C
+```
+
+**End-to-end flow:**
+1. **Buyer** posts a bid (discount from the ladder), **USDC escrowed**, resting.
+2. **Seller** lists shares free in the wallet → escrowed.
+3. **Seller calls `sell()`** — the tx sweeps bids cheapest-first and settles on-chain: seller **paid USDC now**; **BidVault** deployed holding the shares, mints **LP** to the buyer. (No keeper.)
+4. BidVault `requestRedeem` → the next `processEpoch` settles at NAV → `claim` USDC.
+5. **Buyer** redeems LP → USDC @ NAV; profit = the discount. Unsold → redemption queue @ NAV.
+
+**Roadmap (de-risk in steps):**
+- **Phase 0** — `OTCMarket` only: atomic share↔USDC swap at a discount (no BidVault/LP). *Early-exit already works, cheapest.*
+- **Phase 1** — add `OTCFactory` + `BidVault` + LP + auto-redeem → full variant 1a.
+- **Phase 2** — *optional:* off-chain matching/keeper to optimize allocation + cut seller gas, EIP-712 (if needed). The core path does not depend on it.
+
+> Pitch to a manager: **the core contracts are untouched** (Vault/Custody unchanged); OTC is just a layer *in front of* the redemption queue; risk is contained in the 3 new contracts and can ship phase by phase.
+
+---
+
+## 9. On-chain matching (no keeper)
+
+Because we locked **a fixed ladder + buyer-first + cheapest-first**, matching is simple enough to run **inside the seller's tx** — no off-chain matcher. Consistent with `processEpoch`'s on-chain matching.
+
+```
+seller.sell(shares, floor):
+   nav = read NAV on-chain (INavSource)
+   for tier in ladder (cheap → expensive, stop when tier > floor):
+       for bid in bidQueue[tier]   (FIFO, cap N bids/tx for gas):
+           fill: pay USDC to seller · escrow shares into a BidVault · mint LP to buyer
+           if shares exhausted: break
+   remainder → seller routes to the redemption queue (NAV)
+```
+
+- **Bid book = a FIFO array per ladder rung** (a few rungs) → no sorting, near-O(1) insert/cancel, bounded scan.
+- **Atomic**: the whole sweep is one tx; clean revert on error. Nobody defaults.
+- **Gas** is paid by the seller (they want the liquidity), bounded by the cap N — like the Vault's 100/epoch cap.
+
+**When off-chain matching is worth it (Phase 2):** many competing sellers wanting globally-optimal allocation, or cutting seller gas by computing off-chain and only `settle`-ing the result (still on-chain validated). Not required for the core path.
