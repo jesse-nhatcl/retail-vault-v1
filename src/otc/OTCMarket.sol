@@ -25,7 +25,7 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
     IERC20 public immutable usdc;
     OTCFactory public immutable factory;
 
-    /// @dev bidId -> the last BidVault created for it. A bid filled across multiple sell() calls produces multiple BidVaults; only the latest is recorded here (earlier ones are discoverable via BidFilled/BidVaultCreated events). POC simplification.
+    /// @dev bidId -> the bid's single BidVault, 1:1. Set once at placeBid and never overwritten; the buyer's escrow lives inside that vault for the bid's whole life.
     mapping(uint256 => address) public bidVaultOf;
 
     uint16[] internal _ladder;
@@ -64,7 +64,8 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         return _book[discountBps];
     }
 
-    /// @notice Sum of escrowed USDC still owed to resting bids. View only; sums all bids.
+    /// @notice Sum of escrowed USDC still owed to resting bids. The USDC physically lives in each
+    ///         bid's BidVault; this figure equals the sum of every resting vault's `escrow()`.
     function totalEscrowed() external view returns (uint256 sum) {
         uint256 n = bids.length;
         for (uint256 i = 0; i < n; i++) {
@@ -72,7 +73,7 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         }
     }
 
-    /// @notice Place a resting bid at a discount tier. Escrows USDC into the contract.
+    /// @notice Place a resting bid at a discount tier. Deploys the bid's BidVault and escrows USDC into it.
     /// @param discountBps The discount tier in basis points; must be on the fixed ladder.
     /// @param usdcIn Amount of USDC to escrow (6-dec).
     /// @return bidId The index of the newly created bid.
@@ -80,10 +81,20 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         if (usdcIn == 0) revert ZeroAmount();
         if (!onLadder[discountBps]) revert OffLadder(discountBps);
 
-        usdc.safeTransferFrom(msg.sender, address(this), usdcIn);
+        address bv = factory.createBidVault(address(vault), MockUSDC(address(usdc)), msg.sender);
+        usdc.safeTransferFrom(msg.sender, bv, usdcIn);
 
         bidId = bids.length;
-        bids.push(Bid({buyer: msg.sender, discountBps: discountBps, usdcRemaining: usdcIn, status: BidStatus.Resting}));
+        bids.push(
+            Bid({
+                buyer: msg.sender,
+                discountBps: discountBps,
+                usdcRemaining: usdcIn,
+                status: BidStatus.Resting,
+                bidVault: bv
+            })
+        );
+        bidVaultOf[bidId] = bv;
         _book[discountBps].push(bidId);
 
         emit BidPlaced(bidId, msg.sender, discountBps, usdcIn);
@@ -96,12 +107,12 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         if (b.buyer != msg.sender) revert NotBidOwner();
         if (b.status != BidStatus.Resting) revert BidNotResting();
 
-        uint256 refund = b.usdcRemaining;
+        uint256 refundAmt = b.usdcRemaining;
         b.usdcRemaining = 0;
         b.status = BidStatus.Cancelled;
-        usdc.safeTransfer(msg.sender, refund);
+        BidVault(b.bidVault).refund(msg.sender, refundAmt);
 
-        emit BidCancelled(bidId, refund);
+        emit BidCancelled(bidId, refundAmt);
     }
 
     /// @notice Shares (18-dec) that `usdcIn` (6-dec) buys at `discountBps` off the current NAV.
@@ -146,10 +157,10 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
                 remaining -= fill;
                 usdcToSeller += usdcPaid;
 
-                address bv = factory.createBidVault(address(vault), MockUSDC(address(usdc)), b.buyer, fill);
-                shareToken.safeTransfer(bv, fill);
-                BidVault(bv).initRedeem();
-                bidVaultOf[q[i]] = bv;
+                BidVault bv = BidVault(b.bidVault);
+                bv.payOut(msg.sender, usdcPaid); // seller paid from the bid's own escrow
+                shareToken.safeTransfer(address(bv), fill); // bought shares into the bid's vault
+                bv.onFill(fill); // mint LP + queue redeem for this fill
                 emit BidFilled(q[i], b.buyer, fill, usdcPaid);
             }
             if (capped) break;
@@ -159,7 +170,6 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
 
         sharesSold = shares - remaining;
         if (remaining > 0) shareToken.safeTransfer(msg.sender, remaining);
-        usdc.safeTransfer(msg.sender, usdcToSeller);
 
         emit Sold(msg.sender, sharesSold, usdcToSeller, remaining);
     }
@@ -172,10 +182,10 @@ contract OTCMarket is IOTCMarket, ReentrancyGuard {
         for (uint256 i = 0; i < n && i < MAX_SCAN; i++) {
             Bid storage b = bids[i];
             if (b.status == BidStatus.Resting && b.usdcRemaining > 0) {
-                uint256 refund = b.usdcRemaining;
+                uint256 refundAmt = b.usdcRemaining;
                 b.usdcRemaining = 0;
                 b.status = BidStatus.Cancelled;
-                usdc.safeTransfer(b.buyer, refund);
+                BidVault(b.bidVault).refund(b.buyer, refundAmt);
                 count++;
             }
         }

@@ -16,6 +16,7 @@ interface IOTCMarket {
         uint16 discountBps; // must be on the fixed ladder
         uint256 usdcRemaining; // 6-dec, escrowed; decremented as the bid is filled
         BidStatus status;
+        address bidVault; // the bid's single BidVault, deployed at placeBid; holds the escrow
     }
 
     error OffLadder(uint16 discountBps);

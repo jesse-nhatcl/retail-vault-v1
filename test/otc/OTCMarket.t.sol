@@ -5,6 +5,7 @@ import {OTCFixture} from "../helpers/OTCFixture.sol";
 import {IOTCMarket} from "../../src/interfaces/IOTCMarket.sol";
 import {OTCMarket} from "../../src/otc/OTCMarket.sol";
 import {OTCFactory} from "../../src/otc/OTCFactory.sol";
+import {BidVault} from "../../src/otc/BidVault.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract OTCMarketTest is OTCFixture {
@@ -25,7 +26,10 @@ contract OTCMarketTest is OTCFixture {
 
         assertEq(id, 0);
         assertEq(usdc.balanceOf(bob), balBefore - 1000e6);
-        assertEq(usdc.balanceOf(address(otc)), 1000e6);
+        address bv = otc.bidVaultOf(id);
+        assertTrue(bv != address(0));
+        assertEq(BidVault(bv).escrow(), 1000e6);
+        assertEq(usdc.balanceOf(address(otc)), 0); // escrow lives in the bid's vault, not the market
         uint256[] memory book = otc.restingBids(500);
         assertEq(book.length, 1);
         assertEq(book[0], 0);
@@ -52,8 +56,10 @@ contract OTCMarketTest is OTCFixture {
         vm.prank(bob);
         otc.cancelBid(id);
 
+        address bv = otc.bidVaultOf(id);
         assertEq(usdc.balanceOf(bob), balBefore + 1000e6);
-        (,, uint256 rem, IOTCMarket.BidStatus status) = otc.bids(id);
+        assertEq(BidVault(bv).escrow(), 0);
+        (,, uint256 rem, IOTCMarket.BidStatus status,) = otc.bids(id);
         assertEq(rem, 0);
         assertEq(uint8(status), uint8(IOTCMarket.BidStatus.Cancelled));
     }
@@ -77,8 +83,9 @@ contract OTCMarketTest is OTCFixture {
         assertTrue(bv != address(0));
         assertEq(vault.balanceOf(bob), 0);
         assertEq(IERC20(address(bv)).balanceOf(bob), 10_000e18); // LP minted 1:1
+        assertEq(BidVault(bv).escrow(), 0); // escrow fully spent paying the seller
         assertEq(usdc.balanceOf(address(otc)), 0);
-        (,, uint256 rem, IOTCMarket.BidStatus status) = otc.bids(id);
+        (,, uint256 rem, IOTCMarket.BidStatus status,) = otc.bids(id);
         assertEq(rem, 0);
         assertEq(uint8(status), uint8(IOTCMarket.BidStatus.Matched));
     }
@@ -90,7 +97,10 @@ contract OTCMarketTest is OTCFixture {
         _sell(alice, 5000e18, 1000);
 
         assertEq(IERC20(address(otc.bidVaultOf(idB))).balanceOf(bob), 5000e18); // bob's bid filled first
-        assertEq(otc.bidVaultOf(idC), address(0)); // charlie's bid untouched
+        // charlie's bid untouched: vault exists (deployed at placeBid) but unfilled — no LP, full escrow
+        address bvC = otc.bidVaultOf(idC);
+        assertEq(IERC20(address(bvC)).balanceOf(charlie), 0);
+        assertEq(BidVault(bvC).escrow(), 9000e6);
     }
 
     function test_Sell_PartialReturnsUnsold() public {
