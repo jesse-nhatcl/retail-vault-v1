@@ -10,51 +10,94 @@ import {IBidVault} from "../interfaces/IBidVault.sol";
 import {IVault} from "../interfaces/IVault.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 
-/// @notice One per OTC fill. Holds bought shares, mints LP 1:1 to the buyer, redeems via the Vault.
+/// @notice One per OTC bid. Holds the buyer's escrowed USDC, accumulates bought shares across fills,
+///         mints a single LP token to the buyer, and redeems the shares through the core Vault.
 contract BidVault is IBidVault, ERC20, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    address public immutable market;
     IVault public immutable vault;
     IERC20 public immutable usdc;
     address public immutable buyer;
-    uint256 public immutable shares;
-    uint256 public redeemRequestId;
-    bool public redeemInitiated;
 
-    constructor(address vault_, MockUSDC usdc_, address buyer_, uint256 shares_) ERC20("OTC BidVault LP", "otcLP") {
+    uint256[] public redeemRequestIds; // one per fill
+    mapping(uint256 => bool) public claimed; // requestId -> already claimed
+    uint256 public proceeds; // settled USDC received from the Vault; only this is redeemable
+
+    constructor(address vault_, MockUSDC usdc_, address buyer_, address market_) ERC20("OTC BidVault LP", "otcLP") {
         vault = IVault(vault_);
         usdc = IERC20(address(usdc_));
         buyer = buyer_;
-        shares = shares_;
-        _mint(buyer_, shares_); // LP 1:1 with shares held
+        market = market_;
     }
 
-    /// @notice Queue the held shares for redemption through the Vault. Permissionless, once.
-    function initRedeem() external {
-        if (redeemInitiated) revert AlreadyInitiated();
-        redeemInitiated = true;
-        redeemRequestId = vault.requestRedeem(shares);
-        emit RedeemInitiated(redeemRequestId);
+    modifier onlyMarket() {
+        if (msg.sender != market) revert NotMarket();
+        _;
     }
 
-    /// @notice After the epoch settles, pull this vault's USDC payout from the Vault.
+    /// @notice Returns the USDC still escrowed (unfilled) backing the open part of the bid.
+    /// @return The escrowed USDC = total balance minus already-settled proceeds.
+    function escrow() external view returns (uint256) {
+        return usdc.balanceOf(address(this)) - proceeds;
+    }
+
+    /// @notice Market-only: pay the seller out of escrow on a fill.
+    /// @param to     Recipient (the seller).
+    /// @param amount USDC to transfer.
+    function payOut(address to, uint256 amount) external onlyMarket nonReentrant {
+        usdc.safeTransfer(to, amount);
+        emit PaidOut(to, amount);
+    }
+
+    /// @notice Market-only: refund escrowed USDC on cancel or wind-down.
+    /// @param to     Recipient (the buyer).
+    /// @param amount USDC to transfer.
+    function refund(address to, uint256 amount) external onlyMarket nonReentrant {
+        usdc.safeTransfer(to, amount);
+        emit Refunded(to, amount);
+    }
+
+    /// @notice Market-only: mint LP for this fill and queue a redeem of the bought shares.
+    /// @param shares Vault shares (18-dec) acquired in this fill.
+    function onFill(uint256 shares) external onlyMarket {
+        _mint(buyer, shares);
+        uint256 id = vault.requestRedeem(shares);
+        redeemRequestIds.push(id);
+        emit Filled(shares, id);
+    }
+
+    /// @notice Pull settled NAV USDC for all settled fills into the redeemable proceeds pool.
     function claimRedemption() external nonReentrant {
-        vault.claim(redeemRequestId);
+        uint256 before = usdc.balanceOf(address(this));
+        uint256 n = redeemRequestIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 id = redeemRequestIds[i];
+            if (claimed[id]) continue;
+            try vault.claim(id) {
+                claimed[id] = true;
+            } catch {}
+        }
+        proceeds += usdc.balanceOf(address(this)) - before;
         emit RedemptionClaimed(usdc.balanceOf(address(this)));
     }
 
-    /// @notice Recover value when wind-down cancelled the auto-redeem and returned the shares here:
-    ///         burn this vault's shares into the Vault's pro-rata wind-down pool so LP stays redeemable.
+    /// @notice Recover value via the Vault's wind-down pool into the redeemable proceeds pool.
     function claimWindDown() external nonReentrant {
+        uint256 before = usdc.balanceOf(address(this));
         vault.claimWindDown();
+        proceeds += usdc.balanceOf(address(this)) - before;
         emit RedemptionClaimed(usdc.balanceOf(address(this)));
     }
 
-    /// @notice Burn LP for a pro-rata share of the USDC this vault has received.
+    /// @notice Burn `lp` LP tokens for a pro-rata share of the redeemable proceeds.
+    /// @param  lp      LP tokens to burn.
+    /// @return usdcOut USDC paid to the caller.
     function redeem(uint256 lp) external nonReentrant returns (uint256 usdcOut) {
         if (lp == 0 || balanceOf(msg.sender) < lp) revert NothingToClaim();
-        usdcOut = Math.mulDiv(usdc.balanceOf(address(this)), lp, totalSupply());
+        usdcOut = Math.mulDiv(proceeds, lp, totalSupply());
         _burn(msg.sender, lp);
+        proceeds -= usdcOut;
         usdc.safeTransfer(msg.sender, usdcOut);
         emit LpRedeemed(msg.sender, lp, usdcOut);
     }
