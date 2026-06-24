@@ -93,8 +93,15 @@ contract DemoOTC is Script {
 
         _step("Buyer (bob) places a bid: 500 bps tier, escrows 9,500 USDC.");
         uint256 bidId = _placeBid(bob, 500, 9500 * USDC_ONE);
-        (, uint16 d, uint256 esc,) = otc.bids(bidId);
+        (, uint16 d, uint256 esc,,) = otc.bids(bidId);
         _ok(string.concat("Bid #", vm.toString(bidId), " resting on the ", _bps(d), " rung; ", _usd(esc), " escrowed."));
+        _ok(
+            string.concat(
+                "Bid's own BidVault deployed at ",
+                vm.toString(otc.bidVaultOf(bidId)),
+                " - the 9,500.00 USDC escrow lives inside it from now on (market holds 0)."
+            )
+        );
 
         _step("Seller approves 10,000 shares and calls sell(10,000, max 1000 bps) - cheapest rung fills first.");
         uint256 sellerUsdcBefore = usdc.balanceOf(alice);
@@ -102,8 +109,12 @@ contract DemoOTC is Script {
         uint256 sellerGot = usdc.balanceOf(alice) - sellerUsdcBefore;
         address bv = otc.bidVaultOf(bidId);
         uint256 buyerLp = BidVault(bv).balanceOf(bob);
-        _ok(string.concat("Matched ", _sh(sold), " at 5% discount. Seller received ", _usd(sellerGot), " NOW."));
-        _ok(string.concat("BidVault deployed at ", vm.toString(bv), " (auto-queued a redeem)."));
+        _ok(
+            string.concat(
+                "Matched ", _sh(sold), " at 5% discount. Seller paid ", _usd(sellerGot), " from the bid's vault NOW."
+            )
+        );
+        _ok(string.concat("Shares moved into BidVault ", vm.toString(bv), ", which auto-queued a redeem."));
         _ok(string.concat("Buyer minted ", _sh(buyerLp), " of otcLP (1:1 with shares bought)."));
 
         _step("Admin sets NAV 1.00, then processEpoch() settles the BidVault's queued redeem.");
@@ -171,16 +182,28 @@ contract DemoOTC is Script {
         _step("Layer 0 - Charlie needs cash NOW. Deploy OTC market; Dave bids 9,500 USDC at the 500 bps rung.");
         _deployOtc();
         uint256 bidId = _placeBid(dave, 500, 9500 * USDC_ONE);
-        _ok(string.concat("Dave's bid #", vm.toString(bidId), " rests on the 5.00% rung; 9,500.00 USDC escrowed."));
+        _ok(
+            string.concat(
+                "Dave's bid #",
+                vm.toString(bidId),
+                " rests on the 5.00% rung; its own BidVault ",
+                vm.toString(otc.bidVaultOf(bidId)),
+                " holds the 9,500.00 USDC escrow from the moment the bid is placed."
+            )
+        );
 
         _step("Charlie sells 10,000 of his 20,000 shares into the OTC bid - instant fill, no waiting.");
         uint256 charlieBefore = usdc.balanceOf(charlie);
         _sell(charlie, 10_000 * SHARE_ONE, 1000);
         uint256 charlieGot = usdc.balanceOf(charlie) - charlieBefore;
         address bv = otc.bidVaultOf(bidId);
-        _ok(string.concat("Charlie received ", _usd(charlieGot), " IMMEDIATELY (Layer-0 exit, -5%)."));
+        _ok(
+            string.concat(
+                "Charlie was paid ", _usd(charlieGot), " from Dave's bid vault IMMEDIATELY (Layer-0 exit, -5%)."
+            )
+        );
         _ok(string.concat("Bob is still waiting in the queue: ", _sh(vault.pendingRedeemShares(bob)), " pending."));
-        _ok(string.concat("OTC fill auto-queued a redeem via BidVault ", vm.toString(bv), "."));
+        _ok(string.concat("Shares moved into BidVault ", vm.toString(bv), ", which auto-queued a redeem."));
 
         _step("Admin sets NAV 1.00, then processEpoch() settles retail queue AND the BidVault redeem together.");
         pruv.setPrice(1e18);
@@ -329,13 +352,13 @@ contract DemoOTC is Script {
     }
 
     function _multiShowBook(MultiBids memory ids) internal view {
-        (, uint16 d1, uint256 e1,) = otc.bids(ids.bid1);
-        (, uint16 d2, uint256 e2,) = otc.bids(ids.bid2);
-        (, uint16 d3, uint256 e3,) = otc.bids(ids.bid3);
-        (, uint16 d4, uint256 e4,) = otc.bids(ids.bid4);
-        (, uint16 d5, uint256 e5,) = otc.bids(ids.bid5);
-        (, uint16 d6, uint256 e6,) = otc.bids(ids.bid6);
-        _ok("  Resting bid book:");
+        (, uint16 d1, uint256 e1,,) = otc.bids(ids.bid1);
+        (, uint16 d2, uint256 e2,,) = otc.bids(ids.bid2);
+        (, uint16 d3, uint256 e3,,) = otc.bids(ids.bid3);
+        (, uint16 d4, uint256 e4,,) = otc.bids(ids.bid4);
+        (, uint16 d5, uint256 e5,,) = otc.bids(ids.bid5);
+        (, uint16 d6, uint256 e6,,) = otc.bids(ids.bid6);
+        _ok("  Resting bid book (each bid escrows its USDC in its own BidVault at placeBid time):");
         _ok(
             string.concat(
                 "    Bid #",
@@ -422,7 +445,7 @@ contract DemoOTC is Script {
     }
 
     function _multiNarrateFilledBids(MultiBids memory ids) internal view {
-        (, uint16 pd1, uint256 r1, IOTCMarket.BidStatus s1) = otc.bids(ids.bid1);
+        (, uint16 pd1, uint256 r1, IOTCMarket.BidStatus s1,) = otc.bids(ids.bid1);
         _ok(
             string.concat(
                 "Rung ",
@@ -436,7 +459,7 @@ contract DemoOTC is Script {
                 "."
             )
         );
-        (, uint16 pd3, uint256 r3, IOTCMarket.BidStatus s3) = otc.bids(ids.bid3);
+        (, uint16 pd3, uint256 r3, IOTCMarket.BidStatus s3,) = otc.bids(ids.bid3);
         _ok(
             string.concat(
                 "Rung ",
@@ -450,7 +473,7 @@ contract DemoOTC is Script {
                 "."
             )
         );
-        (, uint16 pd4, uint256 r4, IOTCMarket.BidStatus s4) = otc.bids(ids.bid4);
+        (, uint16 pd4, uint256 r4, IOTCMarket.BidStatus s4,) = otc.bids(ids.bid4);
         _ok(
             string.concat(
                 "Rung ",
@@ -467,7 +490,7 @@ contract DemoOTC is Script {
     }
 
     function _multiNarrateRestingBids(MultiBids memory ids) internal view {
-        (, uint16 pd5, uint256 r5, IOTCMarket.BidStatus s5) = otc.bids(ids.bid5);
+        (, uint16 pd5, uint256 r5, IOTCMarket.BidStatus s5,) = otc.bids(ids.bid5);
         _ok(
             string.concat(
                 "Rung ",
@@ -481,7 +504,7 @@ contract DemoOTC is Script {
                 "."
             )
         );
-        (, uint16 pd6, uint256 r6, IOTCMarket.BidStatus s6) = otc.bids(ids.bid6);
+        (, uint16 pd6, uint256 r6, IOTCMarket.BidStatus s6,) = otc.bids(ids.bid6);
         _ok(
             string.concat(
                 "Rung ",
@@ -501,11 +524,11 @@ contract DemoOTC is Script {
         internal
         view
     {
-        (,,, IOTCMarket.BidStatus st2) = otc.bids(ids.bid2);
-        (,,, IOTCMarket.BidStatus st5) = otc.bids(ids.bid5);
-        (,,, IOTCMarket.BidStatus st6) = otc.bids(ids.bid6);
-        (,, uint256 rem5,) = otc.bids(ids.bid5);
-        (,, uint256 rem6,) = otc.bids(ids.bid6);
+        (,,, IOTCMarket.BidStatus st2,) = otc.bids(ids.bid2);
+        (,,, IOTCMarket.BidStatus st5,) = otc.bids(ids.bid5);
+        (,,, IOTCMarket.BidStatus st6,) = otc.bids(ids.bid6);
+        (,, uint256 rem5,,) = otc.bids(ids.bid5);
+        (,, uint256 rem6,,) = otc.bids(ids.bid6);
 
         _step("Aggregate summary.");
         _ok(string.concat("Total shares sold:       ", _sh(sharesSold)));
@@ -516,7 +539,7 @@ contract DemoOTC is Script {
                 "Discount captured by buyers: ", _usd(30_000 * USDC_ONE - sellerReceived), " (blended ~2.83%)"
             )
         );
-        _ok("BidVaults deployed:      4  (one per fill: Buyer1, Buyer3, Buyer4, Buyer5-partial)");
+        _ok("BidVaults deployed:      6  (one per BID at placeBid time; 4 received shares from the sweep)");
         _ok(
             string.concat(
                 "Buyer5 bid #", vm.toString(ids.bid5), " still ", _statusName(st5), "; usdcRemaining=", _usd(rem5), "."
