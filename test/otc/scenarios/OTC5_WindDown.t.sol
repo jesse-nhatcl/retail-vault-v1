@@ -11,16 +11,24 @@ contract OTC5_WindDown is OTCFixture {
     }
 
     function test_WindDownRefundsOpenBids() public {
-        _placeBid(bob, 500, 1000e6);
-        _placeBid(charlie, 1000, 2000e6);
+        uint256 idB = _placeBid(bob, 500, 1000e6);
+        uint256 idC = _placeBid(charlie, 1000, 2000e6);
         uint256 b0 = usdc.balanceOf(bob);
         uint256 c0 = usdc.balanceOf(charlie);
+
+        // per-bid: each resting bid escrows in its own vault.
+        address bvB = otc.bidVaultOf(idB);
+        address bvC = otc.bidVaultOf(idC);
+        assertEq(BidVault(bvB).escrow(), 1000e6);
+        assertEq(BidVault(bvC).escrow(), 2000e6);
 
         vault.triggerWindDown();
         otc.closeForWindDown();
 
         assertEq(usdc.balanceOf(bob), b0 + 1000e6);
         assertEq(usdc.balanceOf(charlie), c0 + 2000e6);
+        assertEq(BidVault(bvB).escrow(), 0); // each vault's escrow refunded
+        assertEq(BidVault(bvC).escrow(), 0);
         assertEq(usdc.balanceOf(address(otc)), 0);
     }
 
