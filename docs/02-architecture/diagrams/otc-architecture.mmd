@@ -7,24 +7,25 @@ graph TB
   end
   subgraph OTCL["OTC Layer 0 (NEW)"]
     MKT["OTCMarket<br/>bid book, cheapest-first match,<br/>USDC escrow, settle, wind-down refund"]
-    FAC["OTCFactory<br/>one BidVault per fill"]
-    BV["BidVault (per fill)<br/>ERC-4626 LP token<br/>auto-redeem + claimWindDown"]
+    FAC["OTCFactory<br/>one BidVault per bid"]
+    BV["BidVault (per bid)<br/>holds escrowed USDC + shares<br/>ERC-4626 LP token<br/>auto-redeem + claimWindDown"]
   end
   subgraph CORE["Retail Vault (UNCHANGED)"]
     VAULT["Vault.sol<br/>shares, queues, processEpoch, NAV"]
     CUST["Custody.sol<br/>wRWA + liquid + idle USDC"]
   end
 
-  BUYER -->|"1 placeBid: USDC escrowed (ladder rung)"| MKT
-  SELLER -->|"2 sell(shares, floor)"| MKT
-  MKT -.->|"3 read NAV"| VAULT
-  MKT -->|"4 pay USDC now, at a discount to NAV"| SELLER
-  MKT -->|"5 deploy"| FAC
+  BUYER -->|"1 placeBid"| MKT
+  MKT -->|"2 deploy vault for this bid"| FAC
   FAC -->|"creates"| BV
-  MKT -->|"6 move filled shares"| BV
-  BV -->|"7 mint LP token (1:1)"| BUYER
-  BV -->|"8 requestRedeem, then claim at NAV"| VAULT
-  ADMIN -->|"9 processEpoch"| VAULT
+  MKT -->|"3 escrow USDC into the bid's vault"| BV
+  SELLER -->|"4 sell(shares, floor)"| MKT
+  MKT -.->|"5 read NAV"| VAULT
+  BV -->|"6 payOut: pay seller from escrow, at a discount to NAV"| SELLER
+  MKT -->|"7 move filled shares + onFill"| BV
+  BV -->|"8 mint LP token (1:1)"| BUYER
+  BV -->|"9 requestRedeem, then claim at NAV"| VAULT
+  ADMIN -->|"10 processEpoch"| VAULT
   MKT -.->|"unsold shares fall to queue"| VAULT
   VAULT -->|"onlyVault"| CUST
 

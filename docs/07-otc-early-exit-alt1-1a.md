@@ -180,11 +180,12 @@ graph TD
 | # | Câu hỏi | Quyết định |
 |---|---|---|
 | 1 | Standalone hay early-exit path? | **Early-exit path** của vault retail (Layer 0). |
-| 2 | Share khóa trong OTC có redeem được / có double-count NAV? | **Escrow bằng `transferFrom` ngay lúc list** → holder mất quyền redeem. Một share một thời điểm chỉ ở **một chỗ** (ví / queue / OTC). Vẫn nằm trong `totalSupply` → **không double-count**. Sau settle, **BidVault** sở hữu share nên *nó* mới `requestRedeem`. |
+| 2 | Share khóa trong OTC có redeem được / có double-count NAV? | **Escrow bằng `transferFrom` ngay lúc list** → holder mất quyền redeem. Một share một thời điểm chỉ ở **một chỗ** (ví / queue / OTC). Vẫn nằm trong `totalSupply` → **không double-count**. Sau mỗi fill, share chảy vào **BidVault** của bid và *nó* mới `requestRedeem`. |
 | 3 | Có thu phí trên discount? | **Bỏ qua** (0% cho POC), để 1 hook. |
-| 4 | Matching on-chain hay cần keeper? | **On-chain mặc định** (xem §9). Buyer đặt bid (USDC escrow sẵn) đứng chờ; **tx `sell()` của seller tự quét bid cheapest-first và settle nguyên tử on-chain** — không cần keeper, đồng nhất với matching của `processEpoch`. Cap số bid duyệt/tx để chặn gas. Keeper/ROuter chỉ là **tùy chọn Phase 2** (tối ưu phân bổ off-chain rồi settle kết quả). |
-| 5 | Quan hệ `cancelRequest` + state nào? | Chỉ list share **đang free trong ví** → OTC và redeem queue **loại trừ nhau**, `cancelRequest` không phải sửa. OTC **chỉ mở trong `EpochBased`**; `triggerWindDown` **refund mọi escrow đang mở**, BidVault đã settle chảy tiếp qua wind-down ở NAV. |
-| 6 | Gas deploy vault+LP mỗi bid? | **Chấp nhận**, bỏ qua. |
+| 4 | Matching on-chain hay cần keeper? | **On-chain mặc định** (xem §9). Buyer đặt bid (USDC escrow ngay vào **BidVault của bid**, deploy tại `placeBid`) đứng chờ; **tx `sell()` của seller tự quét bid cheapest-first và settle nguyên tử on-chain** — không cần keeper, đồng nhất với matching của `processEpoch`. Cap số bid duyệt/tx để chặn gas. Keeper/ROuter chỉ là **tùy chọn Phase 2** (tối ưu phân bổ off-chain rồi settle kết quả). |
+| 5 | Quan hệ `cancelRequest` + state nào? | Chỉ list share **đang free trong ví** → OTC và redeem queue **loại trừ nhau**, `cancelRequest` không phải sửa. OTC **chỉ mở trong `EpochBased`**; `triggerWindDown` **refund mọi escrow chưa khớp** (trong BidVault của từng bid), phần BidVault đã settle chảy tiếp qua wind-down ở NAV. |
+| 6 | BidVault tạo lúc nào — mỗi fill hay mỗi bid? | **Mỗi bid một vault**, deploy ngay tại `placeBid` (qua `OTCFactory.createBidVault`). `otc.bidVaultOf(bidId)` set một lần, ổn định 1:1 với bid. USDC escrow nằm trong BidVault; nhiều fill cho cùng bid **dồn vào một LP token duy nhất**. (Trước đây dự kiến mỗi *fill* một vault — đã bỏ.) |
+| 7 | Gas deploy vault+LP mỗi bid? | **Chấp nhận**, bỏ qua. Đánh đổi: mỗi bid đều deploy 1 vault — kể cả bid sau đó bị hủy hoặc không bao giờ khớp (deploy lãng phí). Chấp nhận trong POC vì gas ngoài scope. |
 
 ---
 
@@ -267,13 +268,13 @@ So sánh 3 lựa chọn (hai buyer cùng chọn 5%):
 **Early-exit Layer 0 theo variant 1a, có kỷ luật giá:**
 
 1. Mục tiêu: early-exit path của vault retail; phần ế → redemption queue ở NAV.
-2. **Buyer-first:** buyer đặt bid, **USDC escrow ngay**, đứng chờ. Mỗi bid = 1 vault ERC-4626 + 1 LP token riêng.
+2. **Buyer-first:** buyer đặt bid, **USDC escrow ngay vào BidVault của bid** (deploy tại `placeBid`), đứng chờ. Mỗi bid = 1 vault ERC-4626 + 1 LP token riêng; nhiều fill cùng bid dồn vào một LP.
 3. **Discount theo ladder cố định** (config), không tự do — gom thanh khoản nhưng vẫn 1a.
 4. **Seller** list share **free trong ví** (escrow lúc list) → fill **cheapest-first**; chỉ giữ **floor**.
 5. **NAV đọc on-chain lúc settle**; không double-count (share vẫn trong `totalSupply`).
 6. **Matching on-chain:** tx `sell()` của seller tự quét bid cheapest-first + settle nguyên tử (cap số bid/tx). Không cần keeper; off-chain matching là tùy chọn Phase 2.
-7. **State:** mở trong `EpochBased`; `WindDown` refund escrow mở, BidVault đã settle chảy tiếp ở NAV.
-8. Fee 0%, gas bỏ qua (POC).
+7. **State:** mở trong `EpochBased`; `WindDown` refund escrow chưa khớp, BidVault đã settle chảy tiếp ở NAV.
+8. Fee 0%, gas bỏ qua (POC) — đánh đổi: deploy 1 vault cho **mọi** bid, kể cả bid hủy/không khớp.
 
 ---
 
@@ -286,18 +287,19 @@ graph LR
     Seller([Seller])
     Buyer([Buyer])
     subgraph NEW["OTC Layer 0 — MỚI"]
-        M[OTCMarket<br/>escrow + settle + ladder]
+        M[OTCMarket<br/>bid book + settle + ladder]
         F[OTCFactory]
-        BV[BidVault / bid<br/>ERC-4626 + LP token]
+        BV[BidVault / bid<br/>escrow USDC + shares + LP token]
     end
     subgraph CORE["Retail Vault — ĐÃ CÓ"]
         V[Vault<br/>shares · queues · processEpoch]
         C[Custody<br/>wRWA + liquid + USDC]
     end
-    Buyer -->|"1 bid + USDC (ladder)"| M
+    Buyer -->|"1 bid (ladder)"| M
+    M -->|"1 deploy + escrow USDC"| F --> BV
     Seller -->|"2 list shares"| M
-    M -->|"3 deploy"| F --> BV
-    M -->|"3 pay USDC ngay"| Seller
+    M -->|"3 payOut USDC ngay (từ BidVault)"| Seller
+    M -->|"3 move shares + onFill"| BV
     BV -->|"3 LP token"| Buyer
     BV -->|"4 requestRedeem / claim"| V
     M -. read NAV .-> V
@@ -305,11 +307,11 @@ graph LR
 ```
 
 **Flow đầu-cuối:**
-1. **Buyer** đặt bid (discount theo ladder), **USDC escrow**, đứng chờ.
+1. **Buyer** đặt bid (discount theo ladder): `placeBid` **deploy ngay BidVault của bid** và escrow USDC vào đó; bid đứng chờ. `bidVaultOf(bidId)` cố định 1:1 với bid.
 2. **Seller** list share free trong ví → escrow.
-3. **Seller gọi `sell()`** — tx tự quét bid cheapest-first + settle on-chain: seller **nhận USDC ngay**; deploy **BidVault** giữ share, mint **LP** cho buyer. (Không cần keeper.)
-4. BidVault `requestRedeem` → `processEpoch` kế settle ở NAV → `claim` USDC.
-5. **Buyer** redeem LP → USDC @ NAV; lời = discount. Phần ế → redemption queue @ NAV.
+3. **Seller gọi `sell()`** — tx tự quét bid cheapest-first + settle on-chain. Mỗi fill: market gọi `bv.payOut(seller, usdcPaid)` (seller **nhận USDC ngay** từ BidVault của bid), chuyển share đã mua vào BidVault, rồi `bv.onFill(...)` mint **LP** cho buyer + queue một redeem. Nhiều fill cùng bid **dồn vào một LP**. (Không cần keeper.)
+4. BidVault `requestRedeem` mỗi fill → `processEpoch` kế settle ở NAV → `claimRedemption` (bounded 100/lần) gom USDC vào `proceeds`.
+5. **Buyer** `redeem(lp)` → USDC @ NAV từ `proceeds`; lời = discount. Phần ế → redemption queue @ NAV.
 
 **Lộ trình (giảm rủi ro theo từng bước):**
 - **Phase 0** — chỉ `OTCMarket`: swap share↔USDC nguyên tử ở discount (chưa BidVault/LP). *Đã có early-exit, rẻ nhất.*
@@ -329,7 +331,8 @@ seller.sell(shares, floor):
    nav = đọc NAV on-chain (INavSource)
    for tier in ladder (rẻ → đắt, dừng khi tier > floor):
        for bid in bidQueue[tier]   (FIFO, cap N bid/tx để chặn gas):
-           fill: trả USDC cho seller · escrow share vào BidVault · mint LP cho buyer
+           bv = bidVaultOf(bid)          // đã deploy từ placeBid
+           fill: bv.payOut USDC cho seller · chuyển share vào bv · bv.onFill mint LP cho buyer
            if đã đủ shares: break
    phần dư → seller tự đẩy xuống redemption queue (NAV)
 ```

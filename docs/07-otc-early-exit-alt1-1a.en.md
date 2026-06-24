@@ -176,11 +176,12 @@ graph TD
 | # | Question | Decision |
 |---|---|---|
 | 1 | Standalone or early-exit path? | **Early-exit path** of the retail vault (Layer 0). |
-| 2 | Can OTC-locked shares be redeemed / do they double-count NAV? | **Escrow via `transferFrom` at list time** → holder loses the redeem right. A share lives in exactly **one** place at a time (wallet / queue / OTC). It stays in `totalSupply` → **no double-count**. After settle, the **BidVault** owns the share, so *it* calls `requestRedeem`. |
+| 2 | Can OTC-locked shares be redeemed / do they double-count NAV? | **Escrow via `transferFrom` at list time** → holder loses the redeem right. A share lives in exactly **one** place at a time (wallet / queue / OTC). It stays in `totalSupply` → **no double-count**. After each fill the share flows into the bid's **BidVault**, so *it* calls `requestRedeem`. |
 | 3 | Fee on the discount? | **Skip** (0% for the POC), leave one hook. |
-| 4 | On-chain matching or a keeper? | **On-chain by default** (see §9). Buyers post bids (USDC escrowed) that rest; **the seller's `sell()` tx sweeps bids cheapest-first and settles atomically on-chain** — no keeper, consistent with `processEpoch` matching. Cap bids scanned per tx for gas. A keeper/ROuter is only an **optional Phase 2** (off-chain allocation, then settle the result). |
-| 5 | Relationship with `cancelRequest` + which state? | Only list shares **free in the wallet** → OTC and the redeem queue are **mutually exclusive**, so `cancelRequest` is untouched. OTC **opens only in `EpochBased`**; `triggerWindDown` **refunds all open escrow**, while settled BidVaults flow on through wind-down at NAV. |
-| 6 | Gas of deploying vault+LP per bid? | **Accepted**, ignored. |
+| 4 | On-chain matching or a keeper? | **On-chain by default** (see §9). Buyers post bids (USDC escrowed straight into the bid's **BidVault**, deployed at `placeBid`) that rest; **the seller's `sell()` tx sweeps bids cheapest-first and settles atomically on-chain** — no keeper, consistent with `processEpoch` matching. Cap bids scanned per tx for gas. A keeper/ROuter is only an **optional Phase 2** (off-chain allocation, then settle the result). |
+| 5 | Relationship with `cancelRequest` + which state? | Only list shares **free in the wallet** → OTC and the redeem queue are **mutually exclusive**, so `cancelRequest` is untouched. OTC **opens only in `EpochBased`**; `triggerWindDown` **refunds all unfilled escrow** (held in each bid's BidVault), while settled BidVaults flow on through wind-down at NAV. |
+| 6 | When is the BidVault created — per fill or per bid? | **One vault per bid**, deployed at `placeBid` (via `OTCFactory.createBidVault`). `bidVaultOf(bidId)` is set once, stable 1:1 with the bid. The escrowed USDC lives in the BidVault; multiple fills on the same bid **accumulate into a single LP token**. (An earlier sketch created one vault per *fill* — dropped.) |
+| 7 | Gas of deploying vault+LP per bid? | **Accepted**, ignored. Trade-off: every bid deploys a vault — including bids later cancelled or never filled (a wasted deploy). Acceptable in the POC since gas is out of scope. |
 
 ---
 
@@ -263,13 +264,13 @@ Comparison (two buyers both pick 5%):
 **Early-exit Layer 0 along variant 1a, with price discipline:**
 
 1. Goal: early-exit path of the retail vault; unsold remainder → redemption queue at NAV.
-2. **Buyer-first:** buyers post bids, **USDC escrowed immediately**, resting. Each bid = 1 ERC-4626 vault + 1 own LP token.
+2. **Buyer-first:** buyers post bids, **USDC escrowed immediately into the bid's BidVault** (deployed at `placeBid`), resting. Each bid = 1 ERC-4626 vault + 1 own LP token; multiple fills on the same bid accumulate into one LP.
 3. **Discount from a fixed ladder** (config), not free — concentrates liquidity yet stays 1a.
 4. **Seller** lists shares **free in the wallet** (escrowed at list) → fills **cheapest-first**; keeps only a **floor**.
 5. **NAV read on-chain at settle**; no double-count (shares stay in `totalSupply`).
 6. **On-chain matching:** the seller's `sell()` tx sweeps bids cheapest-first and settles atomically (cap bids/tx). No keeper; off-chain matching is an optional Phase 2.
-7. **State:** open in `EpochBased`; `WindDown` refunds open escrow, settled BidVaults flow on at NAV.
-8. Fee 0%, gas ignored (POC).
+7. **State:** open in `EpochBased`; `WindDown` refunds unfilled escrow, settled BidVaults flow on at NAV.
+8. Fee 0%, gas ignored (POC) — trade-off: a vault is deployed for **every** bid, including cancelled/unfilled ones.
 
 ---
 
@@ -282,18 +283,19 @@ graph LR
     Seller([Seller])
     Buyer([Buyer])
     subgraph NEW["OTC Layer 0 — NEW"]
-        M[OTCMarket<br/>escrow + settle + ladder]
+        M[OTCMarket<br/>bid book + settle + ladder]
         F[OTCFactory]
-        BV[BidVault / bid<br/>ERC-4626 + LP token]
+        BV[BidVault / bid<br/>escrow USDC + shares + LP token]
     end
     subgraph CORE["Retail Vault — EXISTS"]
         V[Vault<br/>shares · queues · processEpoch]
         C[Custody<br/>wRWA + liquid + USDC]
     end
-    Buyer -->|"1 bid + USDC (ladder)"| M
+    Buyer -->|"1 bid (ladder)"| M
+    M -->|"1 deploy + escrow USDC"| F --> BV
     Seller -->|"2 list shares"| M
-    M -->|"3 deploy"| F --> BV
-    M -->|"3 pay USDC now"| Seller
+    M -->|"3 payOut USDC now (from BidVault)"| Seller
+    M -->|"3 move shares + onFill"| BV
     BV -->|"3 LP token"| Buyer
     BV -->|"4 requestRedeem / claim"| V
     M -. read NAV .-> V
@@ -301,11 +303,11 @@ graph LR
 ```
 
 **End-to-end flow:**
-1. **Buyer** posts a bid (discount from the ladder), **USDC escrowed**, resting.
+1. **Buyer** posts a bid (discount from the ladder): `placeBid` **deploys the bid's BidVault right away** and escrows the USDC into it; the bid rests. `bidVaultOf(bidId)` is fixed 1:1 with the bid.
 2. **Seller** lists shares free in the wallet → escrowed.
-3. **Seller calls `sell()`** — the tx sweeps bids cheapest-first and settles on-chain: seller **paid USDC now**; **BidVault** deployed holding the shares, mints **LP** to the buyer. (No keeper.)
-4. BidVault `requestRedeem` → the next `processEpoch` settles at NAV → `claim` USDC.
-5. **Buyer** redeems LP → USDC @ NAV; profit = the discount. Unsold → redemption queue @ NAV.
+3. **Seller calls `sell()`** — the tx sweeps bids cheapest-first and settles on-chain. Per fill: the market calls `bv.payOut(seller, usdcPaid)` (seller **paid USDC now** out of the bid's BidVault), moves the bought shares into the BidVault, then `bv.onFill(...)` mints **LP** to the buyer and queues a redeem. Multiple fills on the same bid **accumulate into one LP**. (No keeper.)
+4. BidVault `requestRedeem` per fill → the next `processEpoch` settles at NAV → `claimRedemption` (bounded 100/call) gathers USDC into `proceeds`.
+5. **Buyer** `redeem(lp)` → USDC @ NAV out of `proceeds`; profit = the discount. Unsold → redemption queue @ NAV.
 
 **Roadmap (de-risk in steps):**
 - **Phase 0** — `OTCMarket` only: atomic share↔USDC swap at a discount (no BidVault/LP). *Early-exit already works, cheapest.*

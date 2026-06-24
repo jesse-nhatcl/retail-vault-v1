@@ -64,9 +64,9 @@ New code under `src/otc/`. Four units:
 
 | Contract | Responsibility | Notes |
 |---|---|---|
-| `OTCMarket` | Single registry/coordinator. Holds the resting **bid book** + escrowed buyer USDC; the seller's `sell()` reads NAV, matches cheapest-first, and settles atomically on-chain. Gated to `Vault` state. | One instance; `Ownable` for config (ladder); `nonReentrant` on value-moving calls. |
-| `OTCFactory` | Deploys one `BidVault` per accepted bid. | Could be folded into `OTCMarket`; kept separate to mirror the sketch's "vault per buyer". |
-| `BidVault` | ERC-4626-style escrow for one bid: holds bought shares, issues LP token, drives `requestRedeem`/`claim`, distributes USDC pro-rata to LP holders. | Minimal; the "gives out vault token" part of 1a. |
+| `OTCMarket` | Single registry/coordinator. Holds the resting **bid book** (the authoritative `usdcRemaining` per bid); the buyer's USDC is escrowed in each bid's own `BidVault` (the market holds **no** USDC). The seller's `sell()` reads NAV, matches cheapest-first, and settles atomically on-chain. Gated to `Vault` state. | One instance; `Ownable` for config (ladder); `nonReentrant` on value-moving calls. |
+| `OTCFactory` | Deploys one `BidVault` per bid at `placeBid` time, passing `market = msg.sender`. | Could be folded into `OTCMarket`; kept separate to mirror the sketch's "vault per buyer". |
+| `BidVault` | First-class object for one bid: holds the buyer's **escrowed USDC**, accumulates bought **shares** across fills, issues **one LP token**, drives `requestRedeem`/`claim` (bounded), and handles cancel/wind-down **refund**. `payOut`/`refund`/`onFill` are `onlyMarket`. | The full "vault per buyer" of 1a — not a thin share-holder. |
 | Interfaces | `IOTCMarket`, `IBidVault`. | Signatures locked here before implementation. |
 
 Reused as-is: `Vault` (shares + redeem queue), `Custody`, `MockUSDC`, `INavSource` (read NAV at settle time).
@@ -78,8 +78,8 @@ Reused as-is: `Vault` (shares + redeem queue), `Custody`, `MockUSDC`, `INavSourc
 struct Bid {
     address buyer;
     uint16  discountBps;     // must be on the fixed ladder (D8)
-    uint256 usdcIn;          // 6-dec, escrowed in OTCMarket
-    address bidVault;        // 0 until matched
+    uint256 usdcRemaining;   // 6-dec, escrowed in the bid's BidVault; decremented as filled
+    address bidVault;        // set at placeBid, stable 1:1 with the bid
     Status  status;          // Resting | Matched | Cancelled
 }
 mapping(uint16 => Bid[]) bidBook;   // rung (discountBps) -> FIFO queue of bids
@@ -91,15 +91,16 @@ mapping(uint16 => Bid[]) bidBook;   // rung (discountBps) -> FIFO queue of bids
 ### 4.2 Function surface (sketch, not final)
 
 `OTCMarket`
-- `placeBid(uint16 discountBps, uint256 usdcIn) → bidId` — buyer escrows USDC up front into the bid book; reverts if `discountBps` is off-ladder. Bids rest until a seller fills (buyer-first, D9).
-- `sell(uint256 shares, uint16 maxDiscountBps) → filled` — **the matching entry point, fully on-chain (D5, §9).** Seller escrows shares, reads NAV on-chain, sweeps resting bids cheapest-first up to the floor (cap N bids/tx); each match atomically pays the seller, deploys a BidVault with the shares, and mints LP to the buyer. Unsold shares return to the seller.
-- `cancelBid(bidId)` — buyer withdraws a resting bid; USDC refunded.
-- `closeForWindDown()` — admin/`Vault`-driven; refund all open bids when the vault winds down.
+- `placeBid(uint16 discountBps, uint256 usdcIn) → bidId` — **deploys the bid's `BidVault` (via the factory) and escrows the USDC straight into it**; reverts if `discountBps` is off-ladder. `bidVaultOf(bidId)` set once, stable. Bids rest until a seller fills (buyer-first, D9).
+- `sell(uint256 shares, uint16 maxDiscountBps) → filled` — **the matching entry point, fully on-chain (D5, §9).** Seller escrows shares, reads NAV on-chain, sweeps resting bids cheapest-first up to the floor (cap N bids/tx); each fill atomically calls `bv.payOut(seller, usdcPaid)` (seller paid from the bid's vault), moves the bought shares into the BidVault, and calls `bv.onFill(...)` (mint LP + queue redeem). Multiple fills on one bid accumulate into one LP. Unsold shares return to the seller.
+- `cancelBid(bidId)` — buyer withdraws a resting bid; the unfilled escrow is refunded **from the bid's vault** (`BidVault.refund`).
+- `closeForWindDown()` — `Vault`-state-driven; refunds every resting bid's unfilled escrow from its vault when the vault winds down.
 
 `BidVault` (per bid)
-- `constructor(vault, usdc, shares, buyer)` — receives shares, mints LP to buyer, calls `Vault.requestRedeem(shares)`.
-- `claimRedemption()` — after the epoch, pulls USDC via `Vault.claim(requestId)`.
-- `redeem(uint256 lp)` — buyer burns LP → pro-rata USDC out.
+- `constructor(vault, usdc, buyer, market)` — no shares in the ctor; the market funds escrow at `placeBid` and shares arrive per fill.
+- `payOut/refund/onFill` — `onlyMarket`; pay the seller, refund the buyer, or mint LP + `Vault.requestRedeem(shares)` for a fill (one request id per fill).
+- `claimRedemption()` — after the epoch, pulls settled USDC via `Vault.claim` for each fill, **bounded to 100 per call** (cursor), accumulating into `proceeds`.
+- `redeem(uint256 lp)` — buyer burns LP → pro-rata USDC out of `proceeds` (never the unfilled escrow).
 
 ---
 
@@ -115,16 +116,20 @@ sequenceDiagram
     participant V as Vault (existing)
 
     B->>M: placeBid(d, USDC_in)
-    Note over M: USDC escrowed, d on ladder; bid rests
+    M->>F: createBidVault(buyer)
+    F-->>BV: new vault for this bid
+    M->>BV: escrow USDC_in
+    Note over M,BV: d on ladder; bid rests, its vault holds the escrow
     S->>M: sell(M shares, floor) — read NAV, sweep bids cheapest-first
-    Note over M: per matched bid, atomically:
-    M->>S: pay USDC (discounted exit)
-    M->>F: deploy BidVault
-    F-->>BV: new vault
+    Note over M: per matched bid (fill), atomically:
+    M->>BV: payOut(seller, usdcPaid)
+    BV->>S: USDC (discounted exit)
     M->>BV: transfer matched shares
+    M->>BV: onFill(matched)
     BV->>B: mint LP tokens
     BV->>V: requestRedeem(matched)
     Note over V: next epoch settles at NAV
+    B->>BV: claimRedemption() → BV claims each fill
     BV->>V: claim(requestId) → USDC
     B->>BV: redeem(LP) → NAV USDC
 ```
@@ -148,7 +153,7 @@ Unfilled tail: `sell()` returns the unmatched shares to the seller, who can rout
 
 ## 7. Decisions (locked)
 
-- **D1 — Escrow location.** Shares + USDC sit in `OTCMarket` until settle. Market-escrow keeps cancel/refund simple.
+- **D1 — Escrow location (escrow-in-vault).** The bid's USDC is escrowed inside its own `BidVault` (deployed at `placeBid`); the `OTCMarket` holds **no** USDC and keeps only the bid book (the authoritative `usdcRemaining`). Settlement (`payOut`/`onFill`/`refund`) flows through the vault. This makes `BidVault` a first-class object (the literal "one contract per bid") instead of a thin share-holder. Trade-off: a vault is deployed for every bid, including cancelled/unfilled ones — accepted (gas out of scope).
 - **D2 — Auto-queue.** `BidVault` auto-`requestRedeem`s its shares so the buyer gets USDC at the next epoch. (Hold-as-investor is a later option.)
 - **D3 — NAV accounting.** OTC only moves share ownership; shares stay in `totalSupply` → backed, **no double-count**.
 - **D4 — Pricing time.** NAV is read **at `settle`**, on-chain. A stale NAV between bid and settle is the parties' risk.

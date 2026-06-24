@@ -40,10 +40,12 @@ USDC immediately; whatever does not sell falls through to the redemption queue a
 NAV double-count). Full design: [`docs/07-otc-early-exit-alt1-1a.md`](docs/07-otc-early-exit-alt1-1a.md);
 implementation plan: [`docs/superpowers/plans/2026-06-23-otc-early-exit.md`](docs/superpowers/plans/2026-06-23-otc-early-exit.md).
 
-**Mechanism:** buyers post resting bids (USDC escrowed) on a fixed discount ladder (1% / 2.5% / 5% /
-10%); a seller's single `sell()` transaction reads NAV and sweeps them **cheapest-first on-chain** (no
-keeper), settling atomically. Each fill spins up a per-bid `BidVault` (ERC-4626 + LP token) that
-auto-redeems through the existing queue; the buyer redeems LP for the NAV USDC, earning the discount.
+**Mechanism:** placing a bid deploys that bid's own `BidVault` (ERC-4626 + LP token) and escrows the
+buyer's USDC into it, then the bid rests on a fixed discount ladder (1% / 2.5% / 5% / 10%); a seller's
+single `sell()` transaction reads NAV and sweeps the bids **cheapest-first on-chain** (no keeper),
+settling atomically — each fill pays the seller from the bid's vault, moves the bought shares in, and
+mints LP. One vault and one LP per bid, accumulating across partial fills; the vault auto-redeems
+through the existing queue and the buyer redeems LP for the NAV USDC, earning the discount.
 
 | # | Scenario | What it proves |
 |---|----------|----------------|
@@ -53,10 +55,10 @@ auto-redeems through the existing queue; the buyer redeems LP for the NAV USDC, 
 | **OTC-4** | Cancel a resting bid | Buyer withdraws an unmatched bid; USDC fully refunded |
 | **OTC-5** | Wind-down recovery | Open bids refunded; an in-flight BidVault still recovers full NAV (never stranded) |
 | **OTC-6** | Reverts | Off-ladder discount, no bid under floor, or any action outside `EpochBased` revert |
-| **INV** | Escrow fully backed | 128,000 fuzz calls, 0 violations: the market can always refund every resting bid |
+| **INV** | Escrow fully backed | 128,000 fuzz calls, 0 violations: every resting bid's vault escrow equals its `usdcRemaining`, and the market itself holds no USDC |
 
 ```bash
-forge test --match-path 'test/otc/*'                          # 27 OTC tests
+forge test --match-path 'test/otc/*'                          # 33 OTC tests
 forge script script/DemoOTC.s.sol --sig 'run(string)' "OTC1"  # narrated OTC walkthrough
 ```
 
@@ -132,17 +134,17 @@ The `ALL` run finishes with:
 
 ## Running the tests
 
-The automated test suite is the rigorous proof behind the demo (64 tests, exact-number assertions):
+The automated test suite is the rigorous proof behind the demo (70 tests, exact-number assertions):
 
 ```bash
 forge test                                  # full suite
 forge test --match-path 'test/scenarios/*'  # the 8 core acceptance scenarios
-forge test --match-path 'test/otc/*'        # the OTC early-exit extension (27 tests)
+forge test --match-path 'test/otc/*'        # the OTC early-exit extension (33 tests)
 forge test --match-contract S4 -vvv         # one scenario, with traces
 forge test --match-contract InvariantTest   # value-conservation fuzz (200 runs)
 ```
 
-Expected: `64 passed; 0 failed`.
+Expected: `70 passed; 0 failed`.
 
 ---
 
