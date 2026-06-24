@@ -9,8 +9,8 @@ contract OTCFactoryTest is OTCFixture {
     function test_DeploysBidVault() public {
         _setUpOTC();
         OTCFactory f = new OTCFactory();
-        address bv = f.createBidVault(address(vault), usdc, bob, 1000e18);
+        address bv = f.createBidVault(address(vault), usdc, bob);
         assertEq(BidVault(bv).buyer(), bob);
-        assertEq(BidVault(bv).shares(), 1000e18);
+        assertEq(BidVault(bv).market(), address(this));
     }
 }
