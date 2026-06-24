@@ -45,6 +45,49 @@ contract BidVaultTest is OTCFixture {
         assertEq(usdc.balanceOf(bob), bobBefore + 10_000e6);
     }
 
+    function test_ClaimRedemption_CrossEpoch() public {
+        BidVault bv = new BidVault(address(vault), usdc, bob, address(this));
+
+        // fill #1 in epoch N
+        vm.prank(alice);
+        vault.transfer(address(bv), 4000e18);
+        bv.onFill(4000e18);
+        pruv.setPrice(1e18);
+        vault.processEpoch();
+
+        // fill #2 in epoch N+1
+        vm.prank(alice);
+        vault.transfer(address(bv), 6000e18);
+        bv.onFill(6000e18);
+        pruv.setPrice(1e18);
+        vault.processEpoch();
+
+        bv.claimRedemption();
+        assertEq(bv.nextClaimIndex(), 2);
+        assertEq(bv.proceeds(), 10_000e6);
+
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        uint256 out = bv.redeem(10_000e18);
+        assertEq(out, 10_000e6);
+        assertEq(usdc.balanceOf(bob), bobBefore + 10_000e6);
+    }
+
+    function test_Revert_RedeemBeforeClaim() public {
+        BidVault bv = new BidVault(address(vault), usdc, bob, address(this));
+
+        vm.prank(alice);
+        vault.transfer(address(bv), 10_000e18);
+        bv.onFill(10_000e18);
+        pruv.setPrice(1e18);
+        vault.processEpoch();
+
+        // no claimRedemption => proceeds 0 => usdcOut 0 => revert
+        vm.prank(bob);
+        vm.expectRevert(IBidVault.NothingToClaim.selector);
+        bv.redeem(10_000e18);
+    }
+
     function test_Revert_PayOutNotMarket() public {
         BidVault bv = new BidVault(address(vault), usdc, bob, address(this));
         vm.prank(bob);

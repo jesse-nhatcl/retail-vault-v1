@@ -20,8 +20,10 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
     IERC20 public immutable usdc;
     address public immutable buyer;
 
+    uint256 internal constant MAX_CLAIM = 100; // per-call claim cap (mirrors the 100-iteration convention)
+
     uint256[] public redeemRequestIds; // one per fill
-    mapping(uint256 => bool) public claimed; // requestId -> already claimed
+    uint256 public nextClaimIndex; // forward cursor into redeemRequestIds
     uint256 public proceeds; // settled USDC received from the Vault; only this is redeemable
 
     constructor(address vault_, MockUSDC usdc_, address buyer_, address market_) ERC20("OTC BidVault LP", "otcLP") {
@@ -60,34 +62,41 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
 
     /// @notice Market-only: mint LP for this fill and queue a redeem of the bought shares.
     /// @param shares Vault shares (18-dec) acquired in this fill.
-    function onFill(uint256 shares) external onlyMarket {
+    function onFill(uint256 shares) external onlyMarket nonReentrant {
         _mint(buyer, shares);
         uint256 id = vault.requestRedeem(shares);
         redeemRequestIds.push(id);
         emit Filled(shares, id);
     }
 
-    /// @notice Pull settled NAV USDC for all settled fills into the redeemable proceeds pool.
+    /// @notice Claim NAV USDC for settled fills, bounded to MAX_CLAIM per call. Stops at the first
+    ///         not-yet-settled request (later fills are in non-decreasing epochs, so also unsettled).
+    ///         Permissionless; call repeatedly until `nextClaimIndex == redeemRequestIds.length`.
     function claimRedemption() external nonReentrant {
         uint256 before = usdc.balanceOf(address(this));
         uint256 n = redeemRequestIds.length;
-        for (uint256 i = 0; i < n; i++) {
-            uint256 id = redeemRequestIds[i];
-            if (claimed[id]) continue;
-            try vault.claim(id) {
-                claimed[id] = true;
-            } catch {}
+        uint256 end = nextClaimIndex + MAX_CLAIM;
+        if (end > n) end = n;
+        uint256 i = nextClaimIndex;
+        for (; i < end; i++) {
+            try vault.claim(redeemRequestIds[i]) {}
+            catch {
+                break;
+            }
         }
-        proceeds += usdc.balanceOf(address(this)) - before;
-        emit RedemptionClaimed(usdc.balanceOf(address(this)));
+        nextClaimIndex = i;
+        uint256 received = usdc.balanceOf(address(this)) - before;
+        proceeds += received;
+        emit RedemptionClaimed(received);
     }
 
     /// @notice Recover value via the Vault's wind-down pool into the redeemable proceeds pool.
     function claimWindDown() external nonReentrant {
         uint256 before = usdc.balanceOf(address(this));
         vault.claimWindDown();
-        proceeds += usdc.balanceOf(address(this)) - before;
-        emit RedemptionClaimed(usdc.balanceOf(address(this)));
+        uint256 received = usdc.balanceOf(address(this)) - before;
+        proceeds += received;
+        emit RedemptionClaimed(received);
     }
 
     /// @notice Burn `lp` LP tokens for a pro-rata share of the redeemable proceeds.
@@ -96,6 +105,7 @@ contract BidVault is IBidVault, ERC20, ReentrancyGuard {
     function redeem(uint256 lp) external nonReentrant returns (uint256 usdcOut) {
         if (lp == 0 || balanceOf(msg.sender) < lp) revert NothingToClaim();
         usdcOut = Math.mulDiv(proceeds, lp, totalSupply());
+        if (usdcOut == 0) revert NothingToClaim();
         _burn(msg.sender, lp);
         proceeds -= usdcOut;
         usdc.safeTransfer(msg.sender, usdcOut);
