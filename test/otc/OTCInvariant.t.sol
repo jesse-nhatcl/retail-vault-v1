@@ -4,6 +4,8 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {OTCFixture} from "../helpers/OTCFixture.sol";
 import {OTCMarket} from "../../src/otc/OTCMarket.sol";
+import {BidVault} from "../../src/otc/BidVault.sol";
+import {IOTCMarket} from "../../src/interfaces/IOTCMarket.sol";
 import {MockUSDC} from "../../src/mocks/MockUSDC.sol";
 
 /// @notice Drives real placeBid/cancelBid traffic so the escrow invariant exercises live state
@@ -39,14 +41,20 @@ contract OTCHandler is Test {
     function cancelBid(uint256 idSeed) external {
         if (bidIds.length == 0) return;
         uint256 id = bidIds[idSeed % bidIds.length];
-        (address buyer,,,) = otc.bids(id);
+        (address buyer,,,,) = otc.bids(id);
         vm.prank(buyer);
         try otc.cancelBid(id) {} catch {}
     }
+
+    /// @notice Number of bids successfully placed (bidId == index in OTCMarket.bids).
+    function bidCount() external view returns (uint256) {
+        return bidIds.length;
+    }
 }
 
-/// @notice OTC escrow must always be fully backed: the contract's USDC balance is never less than
-///         the sum of resting bids' usdcRemaining (no leakage of buyer escrow).
+/// @notice Per-bid escrow accounting: each resting bid's BidVault holds exactly its `usdcRemaining`
+///         (never under-backed, never double-counted), and the market itself custodies no USDC —
+///         escrow lives in the per-bid vaults, not the OTCMarket.
 contract OTCInvariant is OTCFixture {
     OTCHandler internal handler;
 
@@ -60,7 +68,18 @@ contract OTCInvariant is OTCFixture {
         targetContract(address(handler));
     }
 
+    /// @notice Every resting bid is fully and exactly backed by its own BidVault's escrow.
     function invariant_EscrowFullyBacked() public view {
-        assertGe(usdc.balanceOf(address(otc)), otc.totalEscrowed());
+        uint256 n = handler.bidCount();
+        for (uint256 i = 0; i < n; i++) {
+            (,, uint256 usdcRemaining, IOTCMarket.BidStatus status,) = otc.bids(i);
+            if (status != IOTCMarket.BidStatus.Resting) continue;
+            assertEq(BidVault(otc.bidVaultOf(i)).escrow(), usdcRemaining);
+        }
+    }
+
+    /// @notice The OTCMarket never custodies USDC; escrow is held in each bid's BidVault.
+    function invariant_MarketHoldsNoUsdc() public view {
+        assertEq(usdc.balanceOf(address(otc)), 0);
     }
 }
