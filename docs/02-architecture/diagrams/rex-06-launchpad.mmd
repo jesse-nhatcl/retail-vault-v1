@@ -1,0 +1,31 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    actor R as Retail
+    participant X as REXPrimary<br/>(Launchpad)
+    participant K as Keeper
+    participant H as Hyperlane<br/>Bridge
+    participant E as PruvExecutor<br/>(PRUV)
+    participant P as Pruv RWAToken
+
+    R->>X: depositToLaunchpad(USDC)
+    X->>X: cộng vào tổng gom, cấp receipt
+    Note over X: chờ hết thời hạn launchpad
+
+    alt Đạt min ticket
+        K->>X: closeLaunchpad() -> success
+        X->>H: bridge USDC gom được sang PRUV
+        H-->>E: giao USDC
+        E->>P: deposit
+        P-->>E: wRWA
+        E->>H: bridge wRWA về
+        H-->>X: giao wRWA
+        R->>X: claim(receipt)
+        X-->>R: wRWA
+        Note over X: chuyển sang Epoch-based
+    else Không đạt min ticket
+        K->>X: closeLaunchpad() -> fail
+        R->>X: refund(receipt)
+        X-->>R: hoàn 100% USDC
+        Note over X: LaunchpadFail (kết thúc)
+    end

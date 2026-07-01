@@ -1,0 +1,25 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    participant P as RWAConversion<br/>(PRUV)
+    participant N as NavReporter<br/>(PRUV)
+    participant H as Hyperlane
+    participant O as NavOracleConsumer<br/>(Sepolia)
+    participant X as REXPrimary
+
+    loop mỗi cadence
+        N->>P: value()
+        P-->>N: NAV (18-dec)
+        N->>H: dispatch(NAV) sang Sepolia
+        H-->>O: message (chỉ nhận từ sender/domain hợp lệ)
+        O->>O: kiểm sanity bound + chống replay
+        O->>O: lưu NAV + timestamp
+    end
+
+    Note over X,O: REX đọc NAV khi initiate/matching
+    X->>O: nav()
+    alt Còn tươi (trong ngưỡng staleness)
+        O-->>X: NAV
+    else Quá cũ
+        O-->>X: revert StalePrice
+    end

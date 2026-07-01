@@ -1,0 +1,26 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    participant S as Sub-queue<br/>(USDC)
+    participant M as REXPrimary<br/>matching
+    participant D as Redeem-queue<br/>(wRWA)
+    participant O as NavOracle
+    participant H as Bridge + Pruv leg
+
+    M->>O: nav()
+    O-->>M: NAV
+    M->>S: subTotal = tổng USDC muốn vào
+    M->>D: redeemValue = tổng wRWA muốn ra @ NAV
+    Note over M: matched = min(subTotal, redeemValue)
+    Note over M: match P2P - wRWA (redeemer sang subscriber), USDC (subscriber sang redeemer)
+    Note over M: 🔒 giả định chuyển token thật, không mint share (chờ David, T2.2)
+
+    alt netSub dương (sub thắng)
+        M->>H: bridge (subTotal - matched) USDC sang Pruv deposit
+        H-->>M: wRWA về, chia thêm cho subscriber
+    else netRedeem dương (redeem thắng)
+        M->>H: bridge (redeemValue - matched) wRWA sang Pruv redeem
+        H-->>M: USDC về, chia thêm cho redeemer
+    else khớp đúng
+        Note over M: no-op tới Pruv, chỉ P2P (vẫn emit event)
+    end

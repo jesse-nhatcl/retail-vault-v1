@@ -1,0 +1,30 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    participant X as REXPrimary<br/>(Sepolia)
+    participant H as Hyperlane<br/>Bridge
+    participant E as PruvExecutor<br/>(PRUV)
+    participant K as Keeper /<br/>Monitor
+
+    X->>H: transferRemote(NET USDC) -> msgId
+    Note over X: epoch = in-flight, lưu msgId (idempotent)
+
+    alt Relay thành công
+        H-->>E: giao USDC
+        E->>H: bridge wRWA về -> msgId2
+        H-->>X: giao wRWA
+        K->>X: settleEpoch()
+    else Relay kẹt / timeout
+        K->>H: theo dõi msgId - chưa delivered
+        Note over K: cảnh báo, KHÔNG settle (chống double theo msgId)
+        K->>H: retry delivery
+        alt Recover được
+            H-->>E: giao USDC (muộn)
+            E->>H: bridge wRWA về
+            H-->>X: giao wRWA
+            K->>X: settleEpoch()
+        else Không recover
+            K->>E: admin sweep/recover fund kẹt
+            Note over X,E: không double-mint, không double-pay
+        end
+    end

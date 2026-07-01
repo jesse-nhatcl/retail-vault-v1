@@ -1,0 +1,27 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    actor A as Admin
+    participant X as REXPrimary<br/>(Sepolia)
+    participant K as Keeper
+    participant H as Hyperlane<br/>Bridge
+    participant E as PruvExecutor<br/>(PRUV)
+    participant P as Pruv RWAToken
+    actor R as Retail
+
+    A->>X: triggerWindDown()
+    X->>X: khoá subscription mới
+    X->>X: refund toàn bộ sub pending
+    Note over X,R: retail đã tự cầm wRWA của mình (no custody)
+
+    X->>H: bridge wRWA trong redeem-queue sang PRUV
+    H-->>E: giao wRWA
+    E->>P: redeem
+    P-->>E: USDC
+    E->>H: bridge USDC về
+    H-->>X: giao USDC
+    K->>X: settle - phân phối USDC cho redeem-queue
+    R->>X: claim(receipt)
+    X-->>R: USDC
+    Note over X: 🔒 có ép redeem hộ wRWA retail đang cầm không? (chờ David, T2.4)
+    Note over X: đóng (Closed)

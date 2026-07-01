@@ -1,0 +1,36 @@
+%%{init: {'theme':'dark', 'themeVariables': {'fontFamily':'monospace','fontSize':'15px'}}}%%
+sequenceDiagram
+    autonumber
+    actor R as Retail (Redeemer)
+    participant X as REXPrimary<br/>(Sepolia)
+    participant O as NavOracle<br/>(Sepolia)
+    participant K as Keeper<br/>(off-chain)
+    participant H as Hyperlane<br/>Bridge
+    participant E as PruvExecutor<br/>(PRUV)
+    participant P as Pruv RWAToken<br/>(PRUV)
+
+    Note over R,X: PHASE 1 - Request
+    R->>X: requestRedeem(wRWA)
+    X->>X: khoá wRWA vào redeem-queue, cấp receipt
+    Note over R,X: cancelRequest được trước khi epoch chốt (ERC-7887)
+
+    Note over X,P: PHASE 2 - Epoch initiate
+    K->>X: initiateEpoch()
+    X->>O: nav()
+    O-->>X: NAV
+    X->>X: matching @ NAV (match P2P trước)
+    X->>H: bridge NET wRWA sang PRUV
+    X->>X: epoch = in-flight
+
+    Note over H,P: PHASE 3 - Redeem ở PRUV (async)
+    H-->>E: giao wRWA (relay)
+    E->>P: redeem(wRWA, executor, executor)
+    P-->>E: USDC
+    E->>H: bridge USDC về Sepolia
+
+    Note over X,R: PHASE 4 - Settle + phân phối
+    H-->>X: giao USDC (relay)
+    K->>X: settleEpoch()
+    X->>X: phân phối USDC cho redeemer theo NAV
+    R->>X: claim(receipt)
+    X-->>R: USDC
